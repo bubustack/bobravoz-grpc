@@ -1,0 +1,21 @@
+syntax = "proto3";
+
+package proto;
+
+option go_package = "github.com/bubustack/bobravoz-grpc/proto";
+
+import "google/protobuf/struct.proto";
+
+service Hub {
+  // Process is a bidirectional streaming RPC that allows the hub to process and forward data between engrams.
+  rpc Process (stream DataPacket) returns (stream DataPacket);
+}
+
+// DataPacket represents a unit of data being sent through the streaming pipeline.
+message DataPacket {
+  // Metadata contains information about the StoryRun and the specific step this packet relates to.
+  map<string, string> metadata = 1;
+
+  // Payload is the actual data being processed.
+  google.protobuf.Struct payload = 2;
+}
