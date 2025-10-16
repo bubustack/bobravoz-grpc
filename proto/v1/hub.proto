@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package proto.v1;
+
+option go_package = "github.com/bubustack/bobravoz-grpc/proto/v1";
+
+import "google/protobuf/struct.proto";
+
+// DataPacket represents a unit of data being sent through the streaming pipeline.
+message DataPacket {
+  // Metadata contains information about the StoryRun and the specific step this packet relates to.
+  map<string, string> metadata = 1;
+
+  // Payload is the actual data being processed.
+  google.protobuf.Struct payload = 2;
+
+  // Inputs contains the evaluated step 'with:' configuration (CEL-resolved per packet).
+  // This is analogous to BUBU_INPUTS in batch mode - dynamic configuration that can
+  // reference outputs from previous steps. The Hub evaluates this before forwarding.
+  google.protobuf.Struct inputs = 3;
+}
+
+message ProcessRequest {
+  DataPacket packet = 1;
+}
+
+message ProcessResponse {
+  DataPacket packet = 1;
+}
+
+service HubService {
+  // Process is a bidirectional streaming RPC that allows the hub to process and forward data between engrams.
+  rpc Process (stream ProcessRequest) returns (stream ProcessResponse);
+}
+
+
