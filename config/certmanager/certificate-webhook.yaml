@@ -1,0 +1,16 @@
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  labels:
+    app.kubernetes.io/name: bobravoz-grpc
+    app.kubernetes.io/managed-by: kustomize
+  name: serving-cert
+  namespace: bobrapet-system
+spec:
+  secretName: bobravoz-grpc-webhook-server-cert
+  dnsNames:
+  - SERVICE_NAME.SERVICE_NAMESPACE.svc
+  - SERVICE_NAME.SERVICE_NAMESPACE.svc.cluster.local
+  issuerRef:
+    kind: ClusterIssuer
+    name: bobrapet-shared-ca
