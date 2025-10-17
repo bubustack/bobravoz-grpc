@@ -1,0 +1,61 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - services
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - bubustack.io
+  resources:
+  - stories
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - runs.bubustack.io
+  resources:
+  - storyruns
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - runs.bubustack.io
+  resources:
+  - storyruns/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - runs.bubustack.io
+  resources:
+  - storyruns/status
+  verbs:
+  - get
+  - patch
+  - update
