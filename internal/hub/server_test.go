@@ -552,3 +552,76 @@ func TestServer_Process_MultiplePrimitives(t *testing.T) {
 
 	close(upstreamStream.RecvChan)
 }
+
+func TestServer_Process_HotTransportBypassesEvaluation(t *testing.T) {
+	engram1 := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "ingress", Namespace: "test-ns"},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engram2 := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "responder", Namespace: "test-ns"},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-story", Namespace: "test-ns"},
+		Spec: bubuv1alpha1.StorySpec{
+			Transports: []bubuv1alpha1.StoryTransport{
+				{Name: "rt", TransportRef: "rt"},
+			},
+			Steps: []bubuv1alpha1.Step{
+				{ID: "step1", Name: "ingress-step", Ref: &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "ingress"}}, Transport: "rt"},
+				{ID: "step2", Name: "responder-step", Ref: &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "responder"}}, Needs: []string{"step1"}, Transport: "rt"},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-storyrun", Namespace: "test-ns"},
+		Spec:       runsv1alpha1.StoryRunSpec{StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "test-story"}}},
+	}
+	story.Status.Transports = []bubuv1alpha1.StoryTransportStatus{
+		{Name: "rt", TransportRef: "rt", Mode: enums.TransportModeHot},
+	}
+
+	s := newTestServer(t, story, storyRun, engram1, engram2)
+	md := metadata.New(map[string]string{
+		metaStoryRunName:  "test-storyrun",
+		metaStoryRunNS:    "test-ns",
+		metaCurrentStepID: "step1",
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+
+	downstreamStream := newMockStream(ctx)
+	downstreamStream.On("Context").Return(ctx)
+	downstreamStream.On("Send", mock.Anything).Return(nil)
+	s.streamManager.AddStream(ctx, "test-storyrun", "test-ns", "step2", downstreamStream)
+
+	upstreamStream := newMockStream(ctx)
+	upstreamStream.On("Context").Return(ctx)
+	upstreamStream.On("Recv").Return(nil, nil)
+
+	payload, _ := structpb.NewStruct(map[string]any{"text": "hello"})
+	inputs, _ := structpb.NewStruct(map[string]any{"foo": "bar"})
+	req := &transportpb.ProcessRequest{
+		Packet: &transportpb.DataPacket{
+			Payload: payload,
+			Inputs:  inputs,
+		},
+	}
+	upstreamStream.RecvChan <- req
+
+	go func() {
+		err := s.Process(upstreamStream)
+		require.NoError(t, err)
+	}()
+
+	select {
+	case received := <-downstreamStream.SentChan:
+		require.NotNil(t, received.Packet.Payload)
+		require.NotNil(t, received.Packet.Inputs)
+		assert.Equal(t, "hello", received.Packet.Payload.GetFields()["text"].GetStringValue())
+		assert.Equal(t, "bar", received.Packet.Inputs.GetFields()["foo"].GetStringValue())
+	case <-time.After(1 * time.Second):
+		t.Fatal("timed out waiting for hot-path packet")
+	}
+	close(upstreamStream.RecvChan)
+}

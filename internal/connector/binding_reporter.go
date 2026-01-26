@@ -10,6 +10,7 @@ import (
 
 	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	"github.com/bubustack/bobrapet/pkg/conditions"
+	"github.com/bubustack/bobravoz-grpc/pkg/metrics"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/go-logr/logr"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -69,7 +70,8 @@ func (s capabilityState) isZero() bool {
 }
 
 func newBindingStatusReporter(cfg *Config, log logr.Logger) *bindingStatusReporter {
-	if cfg.Binding.Name == "" || cfg.Binding.Namespace == "" {
+	ref := cfg.Binding.Reference
+	if strings.TrimSpace(ref.Name) == "" || strings.TrimSpace(ref.Namespace) == "" {
 		return nil
 	}
 	restCfg, err := rest.InClusterConfig()
@@ -84,7 +86,7 @@ func newBindingStatusReporter(cfg *Config, log logr.Logger) *bindingStatusReport
 	}
 	return &bindingStatusReporter{
 		client:            client,
-		key:               types.NamespacedName{Name: cfg.Binding.Name, Namespace: cfg.Binding.Namespace},
+		key:               types.NamespacedName{Name: ref.Name, Namespace: ref.Namespace},
 		log:               log.WithName("binding-reporter"),
 		info:              cfg.Binding.Info,
 		listeners:         make(map[chan capabilityState]struct{}),
@@ -113,13 +115,23 @@ func (r *bindingStatusReporter) Start(ctx context.Context) {
 	})
 }
 
+// run drains the reporter's buffered capabilityObservation channel and invokes
+// applyObservation for each entry until the context is canceled or the channel
+// closes (`internal/connector/binding_reporter.go:104-130`).
 func (r *bindingStatusReporter) run(ctx context.Context) {
+	if r == nil {
+		return
+	}
 	for {
 		select {
 		case <-ctx.Done():
+			r.log.V(1).Info("binding status reporter exiting", "binding", r.key.String(), "reason", "context done")
+			metrics.RecordConnectorReporterExit(r.key.Namespace, r.key.Name, "context_done")
 			return
 		case obs, ok := <-r.updates:
 			if !ok {
+				r.log.V(1).Info("binding status reporter exiting", "binding", r.key.String(), "reason", "updates channel closed")
+				metrics.RecordConnectorReporterExit(r.key.Namespace, r.key.Name, "channel_closed")
 				return
 			}
 			if err := r.applyObservation(ctx, obs); err != nil {
@@ -171,48 +183,77 @@ func (r *bindingStatusReporter) report(ctx context.Context) error {
 	return nil
 }
 
+// applyObservation merges a capabilityObservation into the reporter’s cached
+// state, logging which audio/video/binary fields changed, and when necessary
+// patches the TransportBinding before notifying listeners with the cloned
+// snapshot (internal/connector/binding_reporter.go:174-215).
 func (r *bindingStatusReporter) applyObservation(ctx context.Context, obs capabilityObservation) error {
 	if obs.isEmpty() {
+		metrics.RecordConnectorObservationSkip(r.key.Namespace, r.key.Name, "empty")
 		return nil
 	}
 
 	r.stateMu.Lock()
 	changed := false
+	audioChanged := false
+	videoChanged := false
+	binaryChanged := false
 	if obs.audio != nil && !audioCodecEqual(r.state.audio, obs.audio) {
 		r.state.audio = cloneAudioCodec(obs.audio)
 		changed = true
+		audioChanged = true
 	}
 	if obs.video != nil && !videoCodecEqual(r.state.video, obs.video) {
 		r.state.video = cloneVideoCodec(obs.video)
 		changed = true
+		videoChanged = true
 	}
 	if obs.binary != "" && !strings.EqualFold(strings.TrimSpace(r.state.binary), strings.TrimSpace(obs.binary)) {
 		r.state.binary = strings.TrimSpace(obs.binary)
 		changed = true
+		binaryChanged = true
 	}
 	state := r.state.clone()
 	r.stateMu.Unlock()
 
 	if !changed {
+		metrics.RecordConnectorObservationSkip(r.key.Namespace, r.key.Name, "duplicate")
 		return nil
 	}
 
+	r.log.V(1).Info("Observed connector capability change",
+		"audioChanged", audioChanged,
+		"videoChanged", videoChanged,
+		"binaryChanged", binaryChanged,
+	)
 	if err := r.patchState(ctx, state); err != nil {
+		metrics.RecordConnectorPatchFailure(r.key.Namespace, r.key.Name)
+		recordCapabilityFieldEvents(r.key.Namespace, r.key.Name, audioChanged, videoChanged, binaryChanged, "failure")
 		return err
 	}
+	metrics.RecordConnectorPatchSuccess(r.key.Namespace, r.key.Name)
+	recordCapabilityFieldEvents(r.key.Namespace, r.key.Name, audioChanged, videoChanged, binaryChanged, "success")
 	r.notifyListeners(state)
 	return nil
 }
 
+// patchState loads the TransportBinding, applies any non-empty audio/video/binary fields from the
+// cached capabilityState, stamps ObservedGeneration and the Ready condition, and status-patches the
+// binding via MergeFrom (internal/connector/binding_reporter.go:207-231).
 func (r *bindingStatusReporter) patchState(ctx context.Context, state capabilityState) error {
 	var binding transportv1alpha1.TransportBinding
 	if err := r.client.Get(ctx, r.key, &binding); err != nil {
 		if apierrors.IsNotFound(err) {
+			r.log.V(1).Info("TransportBinding deleted before capability update", "binding", r.key.String())
 			return nil
 		}
 		return err
 	}
 	original := binding.DeepCopy()
+	audioChanged := state.audio != nil && !audioCodecEqual(original.Status.NegotiatedAudio, state.audio)
+	videoChanged := state.video != nil && !videoCodecEqual(original.Status.NegotiatedVideo, state.video)
+	trimmedBinary := strings.TrimSpace(state.binary)
+	binaryChanged := trimmedBinary != "" && !strings.EqualFold(strings.TrimSpace(original.Status.NegotiatedBinary), trimmedBinary)
 	if state.audio != nil {
 		codec := *state.audio
 		binding.Status.NegotiatedAudio = &codec
@@ -221,13 +262,25 @@ func (r *bindingStatusReporter) patchState(ctx context.Context, state capability
 		codec := *state.video
 		binding.Status.NegotiatedVideo = &codec
 	}
-	if strings.TrimSpace(state.binary) != "" {
-		binding.Status.NegotiatedBinary = state.binary
+	if trimmedBinary != "" {
+		binding.Status.NegotiatedBinary = trimmedBinary
 	}
 	binding.Status.ObservedGeneration = binding.Generation
 	cm := conditions.NewConditionManager(binding.Generation)
 	cm.SetReadyCondition(&binding.Status.Conditions, true, conditions.ReasonTransportReady, "Connector reported negotiated codecs")
-	return r.client.Status().Patch(ctx, &binding, ctrlclient.MergeFrom(original))
+	if err := r.client.Status().Patch(ctx, &binding, ctrlclient.MergeFrom(original)); err != nil {
+		return err
+	}
+	if audioChanged {
+		metrics.RecordConnectorCapabilityChange(binding.Namespace, binding.Name, "audio")
+	}
+	if videoChanged {
+		metrics.RecordConnectorCapabilityChange(binding.Namespace, binding.Name, "video")
+	}
+	if binaryChanged {
+		metrics.RecordConnectorCapabilityChange(binding.Namespace, binding.Name, "binary")
+	}
+	return nil
 }
 
 func (r *bindingStatusReporter) setState(state capabilityState) {
@@ -253,6 +306,21 @@ func (r *bindingStatusReporter) notifyListeners(state capabilityState) {
 	}
 }
 
+func recordCapabilityFieldEvents(namespace, binding string, audioChanged, videoChanged, binaryChanged bool, outcome string) {
+	if audioChanged {
+		metrics.RecordConnectorCapabilityFieldEvent(namespace, binding, "audio", outcome)
+	}
+	if videoChanged {
+		metrics.RecordConnectorCapabilityFieldEvent(namespace, binding, "video", outcome)
+	}
+	if binaryChanged {
+		metrics.RecordConnectorCapabilityFieldEvent(namespace, binding, "binary", outcome)
+	}
+}
+
+// WatchCapabilities registers a buffered listener, seeds it with the current
+// snapshot, and removes/closes the channel when the provided context is canceled
+// (`internal/connector/binding_reporter.go:256-309`).
 func (r *bindingStatusReporter) WatchCapabilities(ctx context.Context) <-chan capabilityState {
 	ch := make(chan capabilityState, 1)
 	if r == nil {
@@ -264,8 +332,12 @@ func (r *bindingStatusReporter) WatchCapabilities(ctx context.Context) <-chan ca
 		r.listeners = make(map[chan capabilityState]struct{})
 	}
 	r.listeners[ch] = struct{}{}
+	active := len(r.listeners)
 	current := r.state.clone()
 	r.listenersMu.Unlock()
+
+	r.updateListenerGauge(active)
+	r.log.V(1).Info("registered capability listener", "binding", r.key.String(), "activeListeners", active)
 
 	if !current.isZero() {
 		ch <- current
@@ -279,26 +351,45 @@ func (r *bindingStatusReporter) WatchCapabilities(ctx context.Context) <-chan ca
 }
 
 func (r *bindingStatusReporter) removeListener(ch chan capabilityState) {
+	if r == nil {
+		return
+	}
 	r.listenersMu.Lock()
-	defer r.listenersMu.Unlock()
+	removed := false
 	if _, ok := r.listeners[ch]; ok {
 		delete(r.listeners, ch)
 		close(ch)
+		removed = true
+	}
+	active := len(r.listeners)
+	r.listenersMu.Unlock()
+	if removed {
+		r.updateListenerGauge(active)
+		r.log.V(1).Info("removed capability listener", "binding", r.key.String(), "activeListeners", active)
 	}
 }
 
+func (r *bindingStatusReporter) updateListenerGauge(count int) {
+	if r == nil {
+		return
+	}
+	metrics.SetConnectorCapabilityListeners(r.key.Namespace, r.key.Name, float64(count))
+}
+
 func (r *bindingStatusReporter) enqueue(obs capabilityObservation) {
-	if r == nil || obs.isEmpty() {
+	if r == nil {
 		return
 	}
 	if r.updates == nil {
-		r.log.V(1).Info("dropping capability observation; reporter not started")
+		r.log.V(1).Info("dropping capability observation; reporter not started", "binding", r.key.String())
+		metrics.RecordConnectorObservationDrop(r.key.Namespace, r.key.Name, "not_started")
 		return
 	}
 	select {
 	case r.updates <- obs:
 	default:
-		r.log.V(1).Info("dropping capability observation; buffer full")
+		r.log.V(1).Info("dropping capability observation; buffer full", "binding", r.key.String())
+		metrics.RecordConnectorObservationDrop(r.key.Namespace, r.key.Name, "buffer_full")
 	}
 }
 
@@ -501,10 +592,22 @@ func videoCodecEqual(a, b *transportv1alpha1.VideoCodec) bool {
 	return strings.EqualFold(a.Name, b.Name) && strings.EqualFold(strings.TrimSpace(a.Profile), strings.TrimSpace(b.Profile))
 }
 
+var codecAliases = map[string]string{
+	"pcm":       "pcm16",
+	"pcm-16":    "pcm16",
+	"pcm16le":   "pcm16",
+	"wave":      "pcm16",
+	"wav":       "pcm16",
+	"audio/wav": "pcm16",
+}
+
 func normalizeCodecName(name, fallback string) string {
 	normalized := strings.ToLower(strings.TrimSpace(name))
 	if normalized == "" {
-		return fallback
+		normalized = fallback
+	}
+	if alias, ok := codecAliases[normalized]; ok {
+		return alias
 	}
 	return normalized
 }

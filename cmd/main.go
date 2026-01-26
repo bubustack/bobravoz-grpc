@@ -51,12 +51,13 @@ import (
 	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
 	bobrapetcel "github.com/bubustack/bobrapet/pkg/cel"
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobravoz-grpc/internal/config"
 	"github.com/bubustack/bobravoz-grpc/internal/controller"
 	"github.com/bubustack/bobravoz-grpc/internal/hub"
 	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
 	podwebhook "github.com/bubustack/bobravoz-grpc/internal/webhook/pod"
+	"github.com/bubustack/core/contracts"
+	bootstrapruntime "github.com/bubustack/core/runtime/bootstrap"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -66,7 +67,6 @@ var (
 )
 
 const (
-	defaultConnectorImage = "ghcr.io/bubustack/bobravoz-grpc:latest"
 	managerContainerName  = "manager"
 	legacyControllerImage = "controller:latest"
 )
@@ -112,7 +112,7 @@ func main() {
 	flag.IntVar(&hubPort, "hub-port", 9000, "The port for the gRPC hub server.")
 	connectorImageDefault := os.Getenv("CONNECTOR_IMAGE")
 	if connectorImageDefault == "" {
-		connectorImageDefault = defaultConnectorImage
+		connectorImageDefault = config.DefaultConnectorImage
 	}
 	flag.StringVar(
 		&connectorImage,
@@ -139,6 +139,16 @@ func main() {
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
+
+	connectorImageFlag := flag.CommandLine.Lookup("connector-image")
+	connectorImageFlagOverride := connectorImageFlag != nil && connectorImageFlag.Value.String() != connectorImageFlag.DefValue
+	connectorImageEnvOverride := os.Getenv("CONNECTOR_IMAGE") != ""
+	connectorImageExplicit := connectorImageFlagOverride || connectorImageEnvOverride
+
+	connectorPolicyFlag := flag.CommandLine.Lookup("connector-image-pull-policy")
+	connectorPolicyFlagOverride := connectorPolicyFlag != nil && connectorPolicyFlag.Value.String() != connectorPolicyFlag.DefValue
+	connectorPolicyEnvOverride := os.Getenv("CONNECTOR_IMAGE_PULL_POLICY") != ""
+	connectorPolicyExplicit := connectorPolicyFlagOverride || connectorPolicyEnvOverride
 
 	if os.Getenv(contracts.HubPortEnv) == "" {
 		_ = os.Setenv(contracts.HubPortEnv, strconv.Itoa(hubPort))
@@ -296,6 +306,21 @@ func main() {
 		os.Exit(1)
 	}
 
+	if cfg.Connector.Image != "" && !connectorImageExplicit {
+		connectorImage = cfg.Connector.Image
+		setupLog.Info("connector image derived from operator config",
+			"value", connectorImage,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+	if cfg.Connector.ImagePullPolicy != "" && !connectorPolicyExplicit {
+		connectorImagePullPolicy = string(cfg.Connector.ImagePullPolicy)
+		setupLog.Info("connector image pull policy derived from operator config",
+			"value", connectorImagePullPolicy,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+
 	telemetry.InitFromEnv()
 
 	allowInsecure, err := configureHubTLSFromSecret()
@@ -314,37 +339,77 @@ func main() {
 			connectorImage = inferred
 		}
 	}
-	if err := setupConnectorWebhook(mgr, connectorImage, connectorPolicy); err != nil {
-		setupLog.Error(err, "unable to configure connector webhook")
+	bootstrapRunner := bootstrapruntime.Runner{Log: setupLog.WithName("bootstrap")}
+	if err := bootstrapRunner.Register(
+		bootstrapruntime.Entry{
+			Kind:           "webhook",
+			Name:           "Connector",
+			ErrMessage:     "unable to configure connector webhook",
+			SuccessMessage: "connector webhook configured",
+			Register: func() error {
+				return setupConnectorWebhook(mgr, connectorImage, connectorPolicy)
+			},
+		},
+		bootstrapruntime.Entry{
+			Kind:           "controller",
+			Name:           "BobravozGRPC",
+			ErrMessage:     "unable to create controller",
+			SuccessMessage: "controller registered",
+			Fields:         []any{"controller", "BobravozGRPC"},
+			Register: func() error {
+				return (&controller.TransportReconciler{
+					Client: mgr.GetClient(),
+					Scheme: mgr.GetScheme(),
+				}).SetupWithManager(mgr)
+			},
+		},
+		bootstrapruntime.Entry{
+			Kind:           "health",
+			Name:           "healthz",
+			ErrMessage:     "unable to set up health check",
+			SuccessMessage: "health check registered",
+			Register: func() error {
+				return mgr.AddHealthzCheck("healthz", healthz.Ping)
+			},
+		},
+		bootstrapruntime.Entry{
+			Kind:           "health",
+			Name:           "readyz",
+			ErrMessage:     "unable to set up ready check",
+			SuccessMessage: "ready check registered",
+			Register: func() error {
+				return mgr.AddReadyzCheck("readyz", healthz.Ping)
+			},
+		},
+	); err != nil {
 		os.Exit(1)
 	}
 
 	// +kubebuilder:scaffold:builder
 
-	if err = (&controller.TransportReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "BobravozGRPC")
-		os.Exit(1)
-	}
-
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
-		os.Exit(1)
-	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
-		os.Exit(1)
-	}
-
 	// Start the gRPC hub server
-	hubServer, err := hub.NewServer(ctx, mgr.GetClient(), celCfg)
-	if err != nil {
-		setupLog.Error(err, "unable to create hub server")
+	var hubServer *hub.Server
+	hubRunner := bootstrapruntime.Runner{Log: setupLog.WithName("hub")}
+	if err := hubRunner.Register(
+		bootstrapruntime.Entry{
+			Kind:           "hub",
+			Name:           "server",
+			ErrMessage:     "unable to create hub server",
+			SuccessMessage: "hub server initialized",
+			Register: func() error {
+				var serverErr error
+				hubServer, serverErr = hub.NewServer(ctx, mgr.GetClient(), celCfg)
+				return serverErr
+			},
+		},
+	); err != nil {
 		os.Exit(1)
 	}
 	defer hubServer.Close()
+
+	setupLog.Info("=== BOBRAVOZ-GRPC IMAGE VERSION: UPDATED_WITH_AUDIOFRAME_FIX_v2 ===")
+	setupLog.Info("Hub and Connector with AudioFrame passthrough enabled")
+
 	go func() {
 		if err := hubServer.Start(ctx, hubPort, allowInsecure); err != nil {
 			setupLog.Error(err, "problem running hub server")
@@ -505,11 +570,20 @@ func applyHubEnvFromConfig(logger logr.Logger, cfg *config.OperatorConfig) error
 	return nil
 }
 
+// setIntEnvIfUnset writes env to strconv.Itoa(value) when value > 0 and the key
+// is unset, returning true when it changed and surfacing os.Setenv failures so
+// callers can abort startup.
 func setIntEnvIfUnset(env string, value int) (bool, error) {
-	if env == "" || value <= 0 {
+	if env == "" {
+		setupLog.Info("skipping env override because key is empty")
 		return false, nil
 	}
-	if _, exists := os.LookupEnv(env); exists {
+	if value <= 0 {
+		setupLog.Info("skipping env override because value is non-positive", "env", env, "value", value)
+		return false, nil
+	}
+	if existing, exists := os.LookupEnv(env); exists {
+		setupLog.Info("skipping env override because env already set", "env", env, "current", existing)
 		return false, nil
 	}
 	if err := os.Setenv(env, strconv.Itoa(value)); err != nil {
@@ -518,11 +592,20 @@ func setIntEnvIfUnset(env string, value int) (bool, error) {
 	return true, nil
 }
 
+// setDurationEnvIfUnset writes env to value.String() when value > 0 and the key
+// is unset, returning true when it updated the environment and propagating any
+// os.Setenv failure.
 func setDurationEnvIfUnset(env string, value time.Duration) (bool, error) {
-	if env == "" || value <= 0 {
+	if env == "" {
+		setupLog.Info("skipping duration env override because key is empty")
 		return false, nil
 	}
-	if _, exists := os.LookupEnv(env); exists {
+	if value <= 0 {
+		setupLog.Info("skipping duration env override because value is non-positive", "env", env, "value", value)
+		return false, nil
+	}
+	if existing, exists := os.LookupEnv(env); exists {
+		setupLog.Info("skipping duration env override because env already set", "env", env, "current", existing)
 		return false, nil
 	}
 	if err := os.Setenv(env, value.String()); err != nil {
@@ -544,12 +627,15 @@ func setupConnectorWebhook(mgr ctrl.Manager, image string, policy corev1.PullPol
 	return webhook.SetupWithManager(mgr)
 }
 
+// shouldInferConnectorImage returns true when the configured connector image is
+// blank or still set to the default/legacy value, signalling that main should
+// copy the manager's image instead.
 func shouldInferConnectorImage(current string) bool {
 	trimmed := strings.TrimSpace(current)
 	if trimmed == "" {
 		return true
 	}
-	if trimmed == defaultConnectorImage {
+	if trimmed == config.DefaultConnectorImage {
 		return true
 	}
 	return trimmed == legacyControllerImage

@@ -39,15 +39,16 @@ ifndef IMAGE
 endif
 	@echo "Loading image $(IMAGE) into kind cluster '$(KIND_CLUSTER_NAME)'..."
 	@kind load docker-image $(IMAGE) --name $(KIND_CLUSTER_NAME)
-	@kind load docker-image docker.io/library/$(IMAGE) --name $(KIND_CLUSTER_NAME)
 	@echo "Image loaded successfully!"
 
 .PHONY: kind-load-controller
 kind-load-controller: ## Build and load the controller image into kind
 	@echo "Building controller image..."
 	@$(MAKE) docker-build
+	@$(MAKE) docker-build-connector
 	@echo "Loading controller image into kind..."
 	@$(MAKE) kind-load-image IMAGE=$(IMG)
+	@$(MAKE) kind-load-image IMAGE=$(CONNECTOR_IMG)
 	@kubectl --context kind-$(KIND_CLUSTER_NAME) rollout restart deployment bobravoz-grpc-controller-manager -n bobrapet-system
 
 .PHONY: kind-status

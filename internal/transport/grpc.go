@@ -24,17 +24,23 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
 	"github.com/bubustack/bobrapet/pkg/conditions"
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	pkgtransport "github.com/bubustack/bobrapet/pkg/transport"
 	bindinghelper "github.com/bubustack/bobrapet/pkg/transport/binding"
+	transportmetrics "github.com/bubustack/bobravoz-grpc/pkg/metrics"
+	"github.com/bubustack/core/contracts"
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -42,11 +48,21 @@ import (
 // GRPCTransport reconciles the transport for streaming StoryRuns using gRPC.
 type GRPCTransport struct {
 	client.Client
-	Log logr.Logger
+	Log      logr.Logger
+	Recorder record.EventRecorder
+
+	annotationFailureMu   sync.Mutex
+	annotationFailureLast map[string]time.Time
 }
 
 // ErrBindingPending indicates the operator has not created the TransportBinding yet.
 var ErrBindingPending = errors.New("transport binding pending")
+
+const (
+	transportReadyMessageMaxLen             = 512
+	eventReasonEngramTransportAnnotationErr = "EngramTransportAnnotationFailed"
+	annotationFailureEventInterval          = time.Minute
+)
 
 // NewGRPCTransport creates a new GRPCTransport.
 func NewGRPCTransport(cli client.Client) *GRPCTransport {
@@ -54,6 +70,10 @@ func NewGRPCTransport(cli client.Client) *GRPCTransport {
 		Client: cli,
 		Log:    log.Log.WithName("grpc-transport"),
 	}
+}
+
+func (r *GRPCTransport) SetRecorder(recorder record.EventRecorder) {
+	r.Recorder = recorder
 }
 
 // Reconcile configures the gRPC connections between engrams in a streaming story.
@@ -143,7 +163,9 @@ func (r *GRPCTransport) applyTransportUpdate(
 	if resolved {
 		annotationMsg = fmt.Sprintf("transport binding %s resolved", bindingName)
 	}
-	r.markEngramTransportStatus(ctx, namespace, engramName, resolved, annotationMsg)
+	if err := r.markEngramTransportStatus(ctx, namespace, engramName, resolved, annotationMsg, binding); err != nil {
+		return err
+	}
 	logger.Info("Updated transport binding status",
 		"binding", bindingName,
 		"endpoint", binding.Status.Endpoint)
@@ -206,54 +228,144 @@ func getHubServiceDNS(workloadNamespace string) string {
 	return host
 }
 
-func (r *GRPCTransport) markEngramTransportStatus(ctx context.Context, namespace, engramName string, ready bool, message string) {
+// markEngramTransportStatus fetches the Engram and patches
+// TransportReady/TransportReadyMessage when the ready flag or trimmed message
+// changes. Delegates core patch logic to coretransport.EngramAnnotationPatcher.
+func (r *GRPCTransport) markEngramTransportStatus(ctx context.Context, namespace, engramName string, ready bool, message string, binding *transportv1alpha1.TransportBinding) error {
 	if engramName == "" {
-		return
+		return nil
 	}
 
-	key := types.NamespacedName{Namespace: namespace, Name: engramName}
-	var engram bubuv1alpha1.Engram
-	if err := r.Get(ctx, key, &engram); err != nil {
-		if !apierrors.IsNotFound(err) {
-			r.Log.Error(err, "Failed to resolve engram for transport annotation update", "namespace", namespace, "engram", engramName)
+	patcher := pkgtransport.NewEngramAnnotationPatcher(r.Client, r.Log)
+	patched, err := patcher.PatchReadyStatus(ctx, namespace, engramName, ready, message, func(ctx context.Context, key types.NamespacedName) (client.Object, error) {
+		var engram bubuv1alpha1.Engram
+		if err := r.Get(ctx, key, &engram); err != nil {
+			return nil, err
 		}
-		return
-	}
+		return &engram, nil
+	})
 
-	annotations := engram.GetAnnotations()
-	if annotations == nil {
-		annotations = make(map[string]string)
-	}
-
-	readyValue := "false"
-	if ready {
-		readyValue = "true"
-	}
-	trimmedMessage := strings.TrimSpace(message)
-	currentValue := annotations[contracts.TransportReadyAnnotation]
-	currentMessage := strings.TrimSpace(annotations[contracts.TransportReadyMessageAnnotation])
-	if currentValue == readyValue && currentMessage == trimmedMessage {
-		return
-	}
-
-	before := engram.DeepCopy()
-	annotations[contracts.TransportReadyAnnotation] = readyValue
-	if trimmedMessage == "" {
-		delete(annotations, contracts.TransportReadyMessageAnnotation)
-	} else {
-		annotations[contracts.TransportReadyMessageAnnotation] = trimmedMessage
-	}
-	engram.SetAnnotations(annotations)
-
-	if err := r.Patch(ctx, &engram, client.MergeFrom(before)); err != nil {
+	if err != nil {
 		r.Log.Error(err, "Failed to record transport annotation on engram", "namespace", namespace, "engram", engramName)
+		if r.Recorder != nil && r.shouldEmitAnnotationFailureEvent(namespace, engramName, time.Now()) {
+			r.Recorder.Eventf(
+				&bubuv1alpha1.Engram{},
+				corev1.EventTypeWarning,
+				eventReasonEngramTransportAnnotationErr,
+				"Failed to patch transport readiness annotations for %s/%s: %v",
+				namespace,
+				engramName,
+				err,
+			)
+		}
+		return err
 	}
+
+	if patched {
+		transportmetrics.RecordEngramTransportReadyChange(ready)
+		r.Log.Info("Patched Engram transport readiness",
+			"namespace", namespace,
+			"engram", engramName,
+			"ready", ready,
+			"message", pkgtransport.TruncateMessage(message, pkgtransport.MaxReadyMessageLength),
+			"codecs", summarizeBindingCodecs(binding),
+		)
+	}
+	return nil
 }
 
-func (r *GRPCTransport) EnsureCleanUp(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story) error {
+func summarizeBindingCodecs(binding *transportv1alpha1.TransportBinding) string {
+	audio := "unknown"
+	video := "unknown"
+	binary := "unknown"
+	if binding == nil {
+		return fmt.Sprintf("audio=%s video=%s binary=%s", audio, video, binary)
+	}
+
+	if binding.Status.NegotiatedAudio != nil && binding.Status.NegotiatedAudio.Name != "" {
+		audio = binding.Status.NegotiatedAudio.Name
+	} else if binding.Spec.Audio != nil && len(binding.Spec.Audio.Codecs) > 0 && binding.Spec.Audio.Codecs[0].Name != "" {
+		audio = binding.Spec.Audio.Codecs[0].Name
+	}
+
+	if binding.Status.NegotiatedVideo != nil && binding.Status.NegotiatedVideo.Name != "" {
+		video = binding.Status.NegotiatedVideo.Name
+	} else if binding.Spec.Video != nil && len(binding.Spec.Video.Codecs) > 0 && binding.Spec.Video.Codecs[0].Name != "" {
+		video = binding.Spec.Video.Codecs[0].Name
+	} else if binding.Spec.Video != nil && binding.Spec.Video.Raw {
+		video = "raw"
+	}
+
+	if strings.TrimSpace(binding.Status.NegotiatedBinary) != "" {
+		binary = binding.Status.NegotiatedBinary
+	} else if binding.Spec.Binary != nil && len(binding.Spec.Binary.MimeTypes) > 0 {
+		binary = binding.Spec.Binary.MimeTypes[0]
+	}
+
+	return fmt.Sprintf("audio=%s video=%s binary=%s", audio, video, binary)
+}
+
+func (r *GRPCTransport) shouldEmitAnnotationFailureEvent(namespace, engram string, now time.Time) bool {
+	if namespace == "" || engram == "" {
+		return true
+	}
+	key := fmt.Sprintf("%s/%s", namespace, engram)
+	r.annotationFailureMu.Lock()
+	defer r.annotationFailureMu.Unlock()
+	if r.annotationFailureLast == nil {
+		r.annotationFailureLast = make(map[string]time.Time)
+	}
+	if last, ok := r.annotationFailureLast[key]; ok && now.Sub(last) < annotationFailureEventInterval {
+		return false
+	}
+	r.annotationFailureLast[key] = now
+	return true
+}
+
+// EnsureCleanUp walks each streaming step, recomputes the run-scoped Engram name,
+// and marks the Engram transport readiness annotations false so the Stage-to-stage
+// guard sees the cleanup signal before finalizers are removed
+// (internal/transport/grpc.go:301-335).
+func (r *GRPCTransport) EnsureCleanUp(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story) (int, error) {
 	logger := log.FromContext(ctx).WithName("grpc-transport")
-	logger.Info("Skipping gRPC transport cleanup; streaming runtimes are owned by StepRuns and removed via garbage collection")
-	return nil
+	if story == nil {
+		logger.Info("Skipping gRPC transport cleanup; story is nil")
+		return 0, nil
+	}
+
+	namespace := story.Namespace
+	if storyRun != nil && storyRun.Namespace != "" {
+		namespace = storyRun.Namespace
+	}
+	if strings.TrimSpace(namespace) == "" {
+		logger.Info("Skipping gRPC transport cleanup; namespace is unknown")
+		return 0, nil
+	}
+
+	var cleaned int
+	storyRunName := ""
+	if storyRun != nil {
+		storyRunName = storyRun.Name
+	}
+	for i := range story.Spec.Steps {
+		step := &story.Spec.Steps[i]
+		if step.Ref == nil {
+			continue
+		}
+		engramName := getEngramNameForStep(story, storyRun, step)
+		if engramName == "" {
+			continue
+		}
+		msg := fmt.Sprintf("transport binding %s cleaned up", step.Name)
+		if err := r.markEngramTransportStatus(ctx, namespace, engramName, false, msg, nil); err != nil {
+			logger.Error(err, "Failed to reset Engram transport readiness during cleanup", "engram", engramName)
+			return cleaned, err
+		}
+		cleaned++
+	}
+	transportmetrics.RecordTransportCleanup(namespace, cleaned)
+	logger.Info("Finished gRPC transport cleanup", "namespace", namespace, "storyRun", storyRunName, "engramAnnotationsReset", cleaned)
+	return cleaned, nil
 }
 
 // composeWorkloadName matches the operator's DNS-safe naming behavior.

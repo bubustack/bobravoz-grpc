@@ -4,10 +4,11 @@
 
 `bobravoz-grpc` is a specialized, high-performance transport operator for [bobrapet](https://github.com/bubustack/bobrapet), designed to enable real-time, streaming AI and data workflows on Kubernetes. It acts as an intelligent transport hub, dynamically configuring gRPC connections and performing in-flight data processing for `bobrapet`'s `streaming` stories.
 
-Quick links:
+## 🔗 Quick Links
+
 - Transport docs: https://bubustack.io/docs/transport
 
-## 🌟 Key features
+## 🌟 Key Features
 
 - **Intelligent Transport Topologies**: Automatically analyzes `Story` definitions to configure the optimal connection pattern:
   - **Peer-to-Peer (P2P)**: For maximum throughput, engrams are connected directly when no intermediate processing is required.
@@ -23,9 +24,9 @@ Quick links:
 
 - **Control Plane**: The `TransportReconciler` watches for `StoryRun` resources. When it finds one belonging to a `streaming` `Story` configured for `grpc` transport, it analyzes the step graph and injects a deterministic `BUBU_TRANSPORT_BINDING` environment variable so SDK sidecars can resolve upstream/downstream peers from the `TransportBinding` CR.
 
-- **Data Plane**: The operator runs an embedded gRPC `Hub Server`. When a `Story` requires in-flight processing (e.g., a `transform` step), the reconciler configures the engrams to route their data through this hub, which then executes the primitive's logic.
+- **Data Plane**: The operator runs an embedded gRPC `Hub Server`. When a `Story` requires in-flight processing (e.g., a `transform` step), the reconciler configures the engrams to route their data through this hub, which then executes the primitive's logic. Lightweight connectors (built from the separate `ghcr.io/bubustack/bobravoz-connector` image) are injected alongside Engram workloads to bridge them into the hub while keeping the controller image lean.
 
-### 🧭 Connection topologies
+### 🧭 Connection Topologies
 
 Depending on your `Story` definition, `bobravoz-grpc` will create one of two connection types:
 
@@ -57,7 +58,7 @@ Depending on your `Story` definition, `bobravoz-grpc` will create one of two con
     *Resulting Topology:*
     `Engram A --- gRPC --> bobravoz-hub --- gRPC --> Engram B`
 
-## 🚀 Quick start
+## 🚀 Quick Start
 
 Using `bobravoz-grpc` requires an existing `bobrapet` installation.
 
@@ -70,9 +71,22 @@ make install
 
 Next, deploy the operator controller to your cluster:
 ```bash
-make deploy IMG=<your-repo>/bobravoz-grpc:latest
+make deploy IMG=<your-repo>/bobravoz-grpc:<tag>
 ```
-*(Replace `<your-repo>` with your container registry)*
+*(Replace `<your-repo>` and `<tag>` with your container registry and published version.)*
+
+If you maintain your own images, build and push both the controller and connector artifacts:
+```bash
+# Controller / manager
+make docker-build IMG=<your-repo>/bobravoz-grpc:<tag>
+make docker-push IMG=<your-repo>/bobravoz-grpc:<tag>
+
+# Connector sidecar
+make docker-build-connector CONNECTOR_IMG=<your-repo>/bobravoz-connector:<tag>
+make docker-push-connector CONNECTOR_IMG=<your-repo>/bobravoz-connector:<tag>
+```
+Helm chart consumers can then override `controllerManager.manager.image.*` as well as `controllerManager.manager.env.connectorImage` to point at the published tags.
+For in-cluster tweaks without redeploying the controller, update the operator ConfigMap (`connector.image` and `connector.image-pull-policy` keys) and the manager will pick up the new connector sidecar reference automatically.
 
 ## 🛠️ Local Development
 
@@ -97,6 +111,15 @@ make deploy IMG=<your-repo>/bobravoz-grpc:latest
     ```bash
     make test-e2e
     ```
+
+5.  **Generate the Helm chart (writes to `dist/charts/`):**
+    ```bash
+    make helm-chart
+    # override chart name if needed
+    make helm-chart CHART=my-custom-name
+    ```
+    The opinionated `Chart.yaml` and `values.yaml` live beneath `hack/charts/<chart>/`; edit
+    those files to change defaults or ecosystem metadata.
 
 ## 📢 Support, Security, and Changelog
 

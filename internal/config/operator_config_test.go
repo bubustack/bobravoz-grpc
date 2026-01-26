@@ -4,15 +4,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
 	corev1 "k8s.io/api/core/v1"
 )
 
 func TestOperatorConfigParseHubTunables(t *testing.T) {
-	manager := &OperatorConfigManager{
-		defaultConfig: DefaultOperatorConfig(),
-	}
-
 	cm := &corev1.ConfigMap{
 		Data: map[string]string{
 			"hub.buffer-max-messages":      "123",
@@ -24,7 +20,7 @@ func TestOperatorConfigParseHubTunables(t *testing.T) {
 		},
 	}
 
-	cfg := manager.parseConfigMap(cm)
+	cfg := parseOperatorConfigMap(cm)
 	if cfg.Hub.BufferMaxMessages != 123 {
 		t.Fatalf("expected buffer max messages to be 123, got %d", cfg.Hub.BufferMaxMessages)
 	}
@@ -46,16 +42,12 @@ func TestOperatorConfigParseHubTunables(t *testing.T) {
 }
 
 func TestOperatorConfigSecurityModeParsing(t *testing.T) {
-	manager := &OperatorConfigManager{
-		defaultConfig: DefaultOperatorConfig(),
-	}
-
 	cm := &corev1.ConfigMap{
 		Data: map[string]string{
 			"hub.transport-security-mode": "tls",
 		},
 	}
-	cfg := manager.parseConfigMap(cm)
+	cfg := parseOperatorConfigMap(cm)
 	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
 		t.Fatalf("expected security mode tls, got %s", cfg.Hub.SecurityMode)
 	}
@@ -65,7 +57,7 @@ func TestOperatorConfigSecurityModeParsing(t *testing.T) {
 			"hub.allow-insecure": "false",
 		},
 	}
-	cfg = manager.parseConfigMap(cm)
+	cfg = parseOperatorConfigMap(cm)
 	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
 		t.Fatalf("expected deprecated allow-insecure=false to map to tls, got %s", cfg.Hub.SecurityMode)
 	}
@@ -75,8 +67,25 @@ func TestOperatorConfigSecurityModeParsing(t *testing.T) {
 			"hub.allow-insecure": "true",
 		},
 	}
-	cfg = manager.parseConfigMap(cm)
+	cfg = parseOperatorConfigMap(cm)
 	if cfg.Hub.SecurityMode != contracts.TransportSecurityModePlaintext {
 		t.Fatalf("expected deprecated allow-insecure=true to map to plaintext, got %s", cfg.Hub.SecurityMode)
+	}
+}
+
+func TestOperatorConfigConnectorFields(t *testing.T) {
+	cm := &corev1.ConfigMap{
+		Data: map[string]string{
+			"connector.image":             "ghcr.io/example/connector:v1",
+			"connector.image-pull-policy": "Always",
+		},
+	}
+
+	cfg := parseOperatorConfigMap(cm)
+	if cfg.Connector.Image != "ghcr.io/example/connector:v1" {
+		t.Fatalf("expected connector image to be configured, got %s", cfg.Connector.Image)
+	}
+	if cfg.Connector.ImagePullPolicy != corev1.PullAlways {
+		t.Fatalf("expected connector pull policy to be Always, got %s", cfg.Connector.ImagePullPolicy)
 	}
 }

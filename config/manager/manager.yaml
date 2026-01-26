@@ -77,7 +77,7 @@ spec:
         - name: BUBU_HUB_SERVICE_NAME
           value: bobravoz-grpc-bobravoz-grpc-hub
         - name: CONNECTOR_IMAGE
-          value: bobravoz-grpc:latest
+          value: bobravoz-grpc-connector:latest
         - name: CONNECTOR_IMAGE_PULL_POLICY
           value: IfNotPresent
         - name: POD_NAME

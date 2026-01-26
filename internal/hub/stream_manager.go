@@ -18,6 +18,7 @@ package hub
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -25,7 +26,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/go-logr/logr"
 	"google.golang.org/protobuf/types/known/structpb"
@@ -152,9 +153,11 @@ func (sm *StreamManager) RemoveStream(storyRunName, storyRunNamespace, stepID st
 // SendOrBuffer tries to send a packet to a stream, or buffers it if the stream is not yet available.
 func (sm *StreamManager) SendOrBuffer(ctx context.Context, storyRunName, storyRunNamespace, stepID string, packet *transportpb.DataPacket) bool {
 	key := sm.streamKey(storyRunName, storyRunNamespace, stepID)
+	sm.log.Info("SendOrBuffer called", "key", key, "storyRun", storyRunName, "step", stepID)
 	if val, ok := sm.streams.Load(key); ok {
 		entry := val.(*streamEntry)
 		stream := entry.stream
+		sm.log.Info("Stream found, sending packet directly", "key", key)
 
 		// Send directly (Stream.Send handles serialization and context)
 		if err := stream.Send(ctx, packet); err != nil {
@@ -172,11 +175,12 @@ func (sm *StreamManager) SendOrBuffer(ctx context.Context, storyRunName, storyRu
 			}
 			return true
 		}
-		sm.log.V(1).Info("Packet delivered directly to stream", "key", key)
+		sm.log.Info("Packet successfully delivered to stream", "key", key)
 		return true
 	}
 
 	// Stream not found, so buffer the packet.
+	sm.log.Info("Stream NOT found, buffering packet", "key", key, "storyRun", storyRunName, "step", stepID)
 	val, _ := sm.buffers.LoadOrStore(key, NewMessageBuffer(storyRunName, stepID))
 	buffer, _ := val.(*MessageBuffer)
 	if buffer == nil {
@@ -188,7 +192,7 @@ func (sm *StreamManager) SendOrBuffer(ctx context.Context, storyRunName, storyRu
 		sm.log.Info("Buffer full, dropping packet", "key", key, "reason", "stream_not_found")
 		return false
 	}
-	sm.log.Info("Stream not found, packet buffered", "key", key, "bufferSize", buffer.Size())
+	sm.log.Info("Packet buffered successfully", "key", key, "bufferSize", buffer.Size())
 	return true
 }
 
@@ -252,12 +256,13 @@ func (sm *StreamManager) evictOldBuffers(ttl time.Duration) {
 }
 
 // SendHeartbeats sends a heartbeat to all active streams.
-func (sm *StreamManager) SendHeartbeats(ctx context.Context) {
+func (sm *StreamManager) SendHeartbeats(ctx context.Context) error {
 	heartbeatPacket := &transportpb.DataPacket{
 		Metadata: map[string]string{"bubu-heartbeat": "true"},
 		Payload:  &structpb.Struct{},
 	}
 
+	var errs []error
 	sm.streams.Range(func(key, value any) bool {
 		entry, ok := value.(*streamEntry)
 		if !ok {
@@ -267,11 +272,16 @@ func (sm *StreamManager) SendHeartbeats(ctx context.Context) {
 
 		// Use a timeout for sending heartbeats to avoid blocking the loop.
 		sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		defer cancel()
-
 		if err := stream.Send(sendCtx, heartbeatPacket); err != nil {
 			sm.log.Error(err, "Failed to send heartbeat", "key", key)
+			errs = append(errs, fmt.Errorf("%v: %w", key, err))
 		}
+		cancel()
 		return true // continue iteration
 	})
+
+	if len(errs) > 0 {
+		return errors.Join(errs...)
+	}
+	return nil
 }

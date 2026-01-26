@@ -6,7 +6,9 @@ import (
 
 	"github.com/bubustack/tractatus/envelope"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
+	"github.com/go-logr/logr"
 	"google.golang.org/protobuf/proto"
+	"google.golang.org/protobuf/types/known/structpb"
 )
 
 func TestPublishRequestAudioRoundTrip(t *testing.T) {
@@ -19,6 +21,25 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 			TimestampMs:  42,
 		}},
 	}
+	payloadStruct, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct() error = %v", err)
+	}
+	inputsStruct, err := structpb.NewStruct(map[string]any{"baz": 1})
+	if err != nil {
+		t.Fatalf("structpb.NewStruct() error = %v", err)
+	}
+	req.Metadata = map[string]string{
+		metadataEnvelopeKindKey:      "speech",
+		metadataEnvelopeMessageIDKey: "audio-1",
+		metadataEnvelopeTimeKey:      "42",
+		"storyRun":                   "sr-audio",
+	}
+	req.Payload = payloadStruct
+	req.Inputs = inputsStruct
+	req.Transports = []*transportpb.TransportDescriptor{
+		{Name: "livekit", Kind: "media", Mode: "bi"},
+	}
 
 	packet, err := publishRequestToHubPacket(req)
 	if err != nil {
@@ -27,8 +48,20 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 	if packet.GetAudio() == nil {
 		t.Fatalf("expected audio frame on packet")
 	}
+	if packet.Metadata["storyRun"] != "sr-audio" {
+		t.Fatalf("metadata not propagated: %#v", packet.Metadata)
+	}
+	if packet.Payload == nil || packet.Payload.AsMap()["foo"] != "bar" {
+		t.Fatalf("payload not propagated: %#v", packet.Payload)
+	}
+	if packet.Inputs == nil || packet.Inputs.AsMap()["baz"] != 1.0 {
+		t.Fatalf("inputs not propagated: %#v", packet.Inputs)
+	}
+	if len(packet.Transports) != 1 || packet.Transports[0].GetName() != "livekit" {
+		t.Fatalf("transports not propagated: %#v", packet.Transports)
+	}
 
-	roundTrip, err := hubPacketToPublishRequest(packet)
+	roundTrip, err := hubPacketToPublishRequest(logr.Discard(), packet)
 	if err != nil {
 		t.Fatalf("hubPacketToPublishRequest() error = %v", err)
 	}
@@ -38,6 +71,15 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 	}
 	if !proto.Equal(req.GetAudio(), audioReq.Audio) {
 		t.Fatalf("audio frame mismatch\nexpected: %v\nactual: %v", req.GetAudio(), audioReq.Audio)
+	}
+	if got := roundTrip.GetMetadata()["storyRun"]; got != "sr-audio" {
+		t.Fatalf("metadata mismatch: got %s", got)
+	}
+	if roundTrip.GetPayload() == nil || roundTrip.GetPayload().AsMap()["foo"] != "bar" {
+		t.Fatalf("payload missing on roundtrip")
+	}
+	if len(roundTrip.GetTransports()) != 1 || roundTrip.GetTransports()[0].GetName() != "livekit" {
+		t.Fatalf("transports missing on roundtrip: %#v", roundTrip.GetTransports())
 	}
 }
 
@@ -61,7 +103,7 @@ func TestPublishRequestVideoRoundTrip(t *testing.T) {
 		t.Fatalf("expected video frame on packet")
 	}
 
-	roundTrip, err := hubPacketToPublishRequest(packet)
+	roundTrip, err := hubPacketToPublishRequest(logr.Discard(), packet)
 	if err != nil {
 		t.Fatalf("hubPacketToPublishRequest() error = %v", err)
 	}
@@ -101,11 +143,14 @@ func TestPublishRequestBinaryRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("publishRequestToHubPacket() error = %v", err)
 	}
-	if packet.GetBinary() == nil {
-		t.Fatalf("expected binary frame on packet")
+	if packet.GetPayload() == nil || packet.GetPayload().AsMap()["message"] != "hello" {
+		t.Fatalf("expected payload to be unpacked from envelope: %#v", packet.GetPayload())
+	}
+	if len(packet.Metadata) == 0 || packet.Metadata["step"] != "ingest" {
+		t.Fatalf("metadata missing on packet: %#v", packet.Metadata)
 	}
 
-	roundTrip, err := hubPacketToPublishRequest(packet)
+	roundTrip, err := hubPacketToPublishRequest(logr.Discard(), packet)
 	if err != nil {
 		t.Fatalf("hubPacketToPublishRequest() error = %v", err)
 	}

@@ -4,7 +4,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
 )
 
 func TestGetChannelBufferSizeFromEnv(t *testing.T) {

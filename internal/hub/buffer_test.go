@@ -21,7 +21,7 @@ import (
 	"os"
 	"testing"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 )

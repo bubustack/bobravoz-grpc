@@ -4,6 +4,8 @@ metadata:
   name: operator-config
   namespace: system
 data:
+  connector.image: "bobravoz-grpc-connector:latest"
+  connector.image-pull-policy: "IfNotPresent"
   # Controls the transport security mode for the hub/connector pipeline.
   # Accepted values: "tls" or "plaintext".
   hub.transport-security-mode: "plaintext"

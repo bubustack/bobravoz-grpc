@@ -21,12 +21,13 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobrapet/pkg/refs"
+	"github.com/bubustack/core/contracts"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -115,6 +116,20 @@ func TestGetEngramNameForStepFallsBackToRefName(t *testing.T) {
 
 	if got := getEngramNameForStep(nil, nil, step); got != refName {
 		t.Fatalf("expected %q, got %q", refName, got)
+	}
+}
+
+func TestShouldEmitAnnotationFailureEventRespectsInterval(t *testing.T) {
+	tr := &GRPCTransport{}
+	now := time.Unix(0, 0)
+	if !tr.shouldEmitAnnotationFailureEvent("default", "demo", now) {
+		t.Fatalf("expected first emission to pass")
+	}
+	if tr.shouldEmitAnnotationFailureEvent("default", "demo", now.Add(10*time.Second)) {
+		t.Fatalf("expected emissions within interval to be suppressed")
+	}
+	if !tr.shouldEmitAnnotationFailureEvent("default", "demo", now.Add(annotationFailureEventInterval+time.Second)) {
+		t.Fatalf("expected emission after interval to be allowed")
 	}
 }
 

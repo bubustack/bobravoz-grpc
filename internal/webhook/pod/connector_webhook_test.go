@@ -1,19 +1,24 @@
 package pod
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-
+	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	catalogv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/bobrapet/pkg/transport/bindinginfo"
+	"github.com/bubustack/core/contracts"
+	coretransport "github.com/bubustack/core/runtime/transport"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"google.golang.org/protobuf/encoding/protojson"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestBindingEnvOverrides(t *testing.T) {
+func TestDecodeBindingInfo(t *testing.T) {
 	info := &transportpb.BindingInfo{
 		Payload: []byte(`{"env":{"FOO":"bar","bad-name":"noop"}}`),
 	}
@@ -29,7 +34,11 @@ func TestBindingEnvOverrides(t *testing.T) {
 		t.Fatalf("marshal binding envelope: %v", err)
 	}
 
-	overrides := bindingEnvOverrides(string(bytes))
+	result := decodeBindingInfo(string(bytes))
+	if result == nil {
+		t.Fatalf("expected binding info to be returned")
+	}
+	overrides := bindinginfo.EnvOverrides(result)
 	if overrides["FOO"] != "bar" {
 		t.Fatalf("expected FOO override to be bar, got %s", overrides["FOO"])
 	}
@@ -40,12 +49,8 @@ func TestBindingEnvOverrides(t *testing.T) {
 
 func TestAppendEnvOverrides(t *testing.T) {
 	base := []corev1.EnvVar{{Name: "FOO", Value: "existing"}}
-	overrides := map[string]string{
-		"FOO":      "override",
-		"_VALID_":  "1",
-		"1INVALID": "skip",
-	}
-	envs := appendEnvOverrides(base, overrides)
+	info := &transportpb.BindingInfo{Payload: []byte(`{"env":{"FOO":"override","_VALID_":"1","1INVALID":"skip"}}`)}
+	envs := coretransport.AppendBindingEnvOverrides(base, info)
 	if got := lookupEnv(envs, "FOO"); got != "override" {
 		t.Fatalf("expected FOO override to win, got %s", got)
 	}
@@ -96,5 +101,34 @@ func TestInjectConnectorPropagatesEnvOverrides(t *testing.T) {
 	connector := pod.Spec.Containers[1]
 	if got := lookupEnv(connector.Env, contracts.GRPCMessageTimeoutEnv); got != "25s" {
 		t.Fatalf("expected connector to receive message timeout override, got %s", got)
+	}
+}
+
+func TestResolveBindingEnvValueFromSanitizedAnnotation(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := transportv1alpha1.AddToScheme(scheme); err != nil {
+		t.Fatalf("add transport scheme: %v", err)
+	}
+	binding := &transportv1alpha1.TransportBinding{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "demo-binding",
+			Namespace: "default",
+		},
+	}
+	binding.Spec.TransportRef = "grpc-demo"
+	binding.Spec.Driver = "driver"
+	client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(binding).Build()
+
+	webhook := NewConnectorWebhook(client, "image", corev1.PullIfNotPresent)
+	value, err := webhook.resolveBindingEnvValue(context.Background(), "default", "default/demo-binding")
+	if err != nil {
+		t.Fatalf("resolve binding env value: %v", err)
+	}
+	info, err := bindinginfo.Decode(value)
+	if err != nil {
+		t.Fatalf("decode binding info: %v", err)
+	}
+	if info.GetTransportRef() != "grpc-demo" {
+		t.Fatalf("expected transport ref grpc-demo, got %s", info.GetTransportRef())
 	}
 }

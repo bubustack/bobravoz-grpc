@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 
+	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	catalogv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	transportutil "github.com/bubustack/bobrapet/pkg/transport"
 	"github.com/bubustack/bobrapet/pkg/transport/bindinginfo"
+	"github.com/bubustack/core/contracts"
+	coretransport "github.com/bubustack/core/runtime/transport"
+	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -32,7 +35,6 @@ const (
 )
 
 var connectorWebhookLog = ctrl.Log.WithName("connector-webhook")
-var envVarPattern = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
 // ConnectorWebhook injects the transport connector sidecar into realtime Engram pods.
 type ConnectorWebhook struct {
@@ -78,9 +80,17 @@ func (w *ConnectorWebhook) Handle(ctx context.Context, req admission.Request) ad
 		return admission.Errored(http.StatusBadRequest, fmt.Errorf("fetch engram %s/%s: %w", pod.Namespace, engramName, err))
 	}
 
-	bindingValue := engram.Annotations[contracts.TransportBindingAnnotation]
-	if bindingValue == "" && pod.Annotations != nil {
-		bindingValue = pod.Annotations[contracts.TransportBindingAnnotation]
+	bindingValue := ""
+	if pod.Annotations != nil {
+		bindingValue = strings.TrimSpace(pod.Annotations[contracts.TransportBindingAnnotation])
+	}
+	if bindingValue == "" {
+		ref := engram.Annotations[contracts.TransportBindingAnnotation]
+		resolved, err := w.resolveBindingEnvValue(ctx, pod.Namespace, ref)
+		if err != nil {
+			return admission.Errored(http.StatusBadRequest, err)
+		}
+		bindingValue = resolved
 	}
 	if bindingValue == "" {
 		return admission.Allowed("engram not bound to transport")
@@ -113,9 +123,9 @@ func (w *ConnectorWebhook) injectConnector(pod *corev1.Pod, engram *catalogv1alp
 	}
 
 	main := &pod.Spec.Containers[0]
-	overrides := bindingEnvOverrides(bindingValue)
+	bindingInfo := decodeBindingInfo(bindingValue)
 
-	env := w.buildEnv(pod, engram, bindingValue, overrides)
+	env := w.buildEnv(pod, engram, bindingValue, bindingInfo)
 	connector := corev1.Container{
 		Name:            "transport-connector",
 		Image:           w.image,
@@ -133,7 +143,7 @@ func (w *ConnectorWebhook) buildEnv(
 	pod *corev1.Pod,
 	engram *catalogv1alpha1.Engram,
 	bindingValue string,
-	overrides map[string]string,
+	bindingInfo *transportpb.BindingInfo,
 ) []corev1.EnvVar {
 	main := &pod.Spec.Containers[0]
 	env := []corev1.EnvVar{
@@ -232,7 +242,9 @@ func (w *ConnectorWebhook) buildEnv(
 		}
 	}
 
-	return appendEnvOverrides(env, overrides)
+	env = coretransport.AppendTransportMetadataEnv(env, bindingInfo)
+	env = coretransport.AppendBindingEnvOverrides(env, bindingInfo)
+	return env
 }
 
 func (w *ConnectorWebhook) copyTLSVolumeMounts(pod *corev1.Pod) []corev1.VolumeMount {
@@ -312,7 +324,39 @@ func resolveHubEndpoint(namespace string) string {
 	return fmt.Sprintf("%s:%s", host, port)
 }
 
-func bindingEnvOverrides(bindingValue string) map[string]string {
+func (w *ConnectorWebhook) resolveBindingEnvValue(ctx context.Context, defaultNamespace, annotation string) (string, error) {
+	value := strings.TrimSpace(annotation)
+	if value == "" {
+		return "", nil
+	}
+	if strings.HasPrefix(value, "{") {
+		return value, nil
+	}
+	namespace := defaultNamespace
+	name := value
+	if slash := strings.Index(value, "/"); slash >= 0 {
+		if prefix := strings.TrimSpace(value[:slash]); prefix != "" {
+			namespace = prefix
+		}
+		name = value[slash+1:]
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "", nil
+	}
+	var binding transportv1alpha1.TransportBinding
+	key := types.NamespacedName{Name: name, Namespace: namespace}
+	if err := w.client.Get(ctx, key, &binding); err != nil {
+		return "", fmt.Errorf("fetch transport binding %s: %w", key.String(), err)
+	}
+	env, err := transportutil.EncodeBindingEnv(&binding)
+	if err != nil {
+		return "", fmt.Errorf("encode transport binding %s: %w", key.String(), err)
+	}
+	return env, nil
+}
+
+func decodeBindingInfo(bindingValue string) *transportpb.BindingInfo {
 	if strings.TrimSpace(bindingValue) == "" {
 		return nil
 	}
@@ -321,31 +365,7 @@ func bindingEnvOverrides(bindingValue string) map[string]string {
 		connectorWebhookLog.Error(err, "failed to decode transport binding info", "binding", bindingValue)
 		return nil
 	}
-	return bindinginfo.EnvOverrides(info)
-}
-
-func appendEnvOverrides(env []corev1.EnvVar, overrides map[string]string) []corev1.EnvVar {
-	if len(overrides) == 0 {
-		return env
-	}
-	for key, value := range overrides {
-		name := strings.TrimSpace(key)
-		if name == "" || !envVarPattern.MatchString(name) {
-			continue
-		}
-		env = setOrReplaceEnv(env, corev1.EnvVar{Name: name, Value: value})
-	}
-	return env
-}
-
-func setOrReplaceEnv(env []corev1.EnvVar, candidate corev1.EnvVar) []corev1.EnvVar {
-	for i := range env {
-		if env[i].Name == candidate.Name {
-			env[i].Value = candidate.Value
-			return env
-		}
-	}
-	return append(env, candidate)
+	return info
 }
 
 func deriveConnectorSecurityContext(main *corev1.Container) *corev1.SecurityContext {

@@ -1,65 +1,65 @@
-# Contributing to bobravoz-grpc (transport operator)
+# Contributing to bobravoz-grpc
 
-First off, thank you for considering contributing. Your help is appreciated.
+Thank you for helping make the transport operator fast, stable, and Kubernetes-native. This guide explains how to report issues, propose features, and ship high-quality pull requests.
 
-This document provides guidelines for contributing to the operator and its docs. Please read it carefully to ensure a smooth collaboration process.
+## Reporting bugs
 
-## How Can I Contribute?
+- Search [existing issues](https://github.com/bubustack/bobravoz-grpc/issues?q=is%3Aissue) before filing a new one.
+- When opening a bug, include:
+  - The `Story` / `StoryRun` snippet that reproduces the issue, plus any annotations that select the `grpc` transport.
+  - Logs from the transport controller (`kubectl logs deployment/bobravoz-grpc-controller-manager`) and affected Engram pods.
+  - Kubernetes version, cluster type (Kind/Minikube/managed), and whether transport bindings were pre-existing or newly created.
+  - If the problem involves streaming payloads, attach the relevant `TransportBinding` status or `BUBU_TRANSPORT_BINDING` contents (with secrets redacted).
+- Tag the issue with `kind/bug`, an `area/*` label (operator, transport, sdk, engram, impulse), and `priority/*` if known.
 
-### Reporting Bugs
+## Requesting enhancements
 
-- **Ensure the bug was not already reported** by searching on GitHub under [Issues](https://github.com/bubustack/bobravoz-grpc/issues).
-- If you're unable to find an open issue addressing the problem, [open a new one](https://github.com/bubustack/bobravoz-grpc/issues/new). Be sure to include a **title and clear description**, as much relevant information as possible, and a **code sample** or an **executable test case** demonstrating the expected behavior that is not occurring.
+- Use the [feature template](https://github.com/bubustack/bobravoz-grpc/issues/new?template=feature_request.md) to describe the scenario, scale requirements, and proposed behaviour.
+- For CRD or API changes, include the desired spec/field layout and how it interacts with existing bobrapet semantics (`PerStory`, `PerStoryRun`, annotations, etc.).
+- If the request spans multiple repos (e.g., SDK + operator), start a thread in [org-wide Discussions](https://github.com/orgs/bubustack/discussions) so we can coordinate.
 
-### Suggesting Enhancements
+## Pull requests
 
-- Open a new issue to discuss your enhancement. Clearly describe the proposed enhancement and its benefits.
-- Provide code snippets, mockups, or diagrams to illustrate your idea.
+1. **Fork & branch** from `main`, keeping each PR focused on a single change-set.
+2. **Discuss breaking changes early.** Open an issue before altering CRDs, metrics, or environment contracts so downstream components can prepare.
+3. **Run the quality gates** locally:
+   ```bash
+   make lint            # golangci-lint v2.4.0 (downloaded into ./bin)
+   make test            # envtest-backed unit tests
+   make generate        # when APIs or deep-copy types change
+   make manifests       # updates config/crd/bases/*
+   make test-e2e        # optional, spins up Kind to validate transport bindings
+   make docker-build IMG=<registry>/bobravoz-grpc:dev
+   ```
+4. **Document user-facing changes.** Update `README.md`, `SUPPORT.md`, CRD comments, and sample manifests when behaviour or defaults change.
+5. **Fill in the PR template.** Include the commands you ran, link to relevant issues (`Fixes #123`), and call out any follow-up work.
 
-### Pull Requests
-
-- Fork the repository and create your branch from `main`.
-- Ensure the test suite passes: `make test` (envtest will be installed automatically).
-- Lint: `make lint` (golangci-lint via ./bin).
-- Regenerate CRDs when touching API types: `make generate`.
-- Submit the pull request.
-
-## Development Workflow
+## Development workflow
 
 ### Prerequisites
 
-- Go 1.24+
-- Docker
-- `make`
+- Go 1.25.1 or later (matching the module’s `go` directive).
+- Docker or another OCI-compatible builder.
+- `make`, `kubectl`, and a Kubernetes cluster (Kind/Minikube is enough for local testing).
 
-### Setup
+### Local setup
 
-1.  Fork the repository.
-2.  Clone your fork: `git clone https://github.com/your_username/bobravoz-grpc.git`
-3.  Navigate to the repository directory: `cd bobravoz-grpc`
-4.  Build: `make build`
+1. Fork the repo and clone your fork.
+2. `cd bobravoz-grpc`
+3. `make lint-config` if you need to verify golangci-lint settings.
+4. `make help` lists every available target grouped by category.
 
-### Running Tests
+### Running tests
 
 ```bash
-# Run all tests
+# Fast unit tests (envtest)
 make test
+
+# End-to-end Kind tests (optional but recommended for transport changes)
+make test-e2e
 ```
 
-### Commit Message Conventions
+### Commit style & Code of Conduct
 
-We follow the [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) specification. This allows for automated changelog generation and semantic versioning.
-
-Examples:
-- `feat: Add support for custom retry policies`
-- `fix: Correctly handle nil inputs in Process`
-- `docs: Update README with new quickstart`
-- `chore: Upgrade to Go 1.24`
-
-### Code of Conduct
-
-Participation in this project is governed by the
-[Contributor Covenant Code of Conduct](./CODE_OF_CONDUCT.md). By participating,
-you are expected to uphold this code. Please report unacceptable behavior to
-conduct@bubustack.com.
-
+- Follow [Conventional Commits](https://www.conventionalcommits.org/en/v1.0.0/) (`feat:`, `fix:`, `docs:`, `chore:`) so release tooling can generate changelog entries automatically.
+- Participation in this project is governed by the [Contributor Covenant Code of Conduct](./CODE_OF_CONDUCT.md). Report unacceptable behaviour to [conduct@bubustack.com](mailto:conduct@bubustack.com) or via the org Discussions moderation queue.

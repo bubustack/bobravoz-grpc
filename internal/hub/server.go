@@ -36,13 +36,16 @@ import (
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
 	bobrapetcel "github.com/bubustack/bobrapet/pkg/cel"
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobrapet/pkg/enums"
 	"github.com/bubustack/bobrapet/pkg/logging"
 	"github.com/bubustack/bobrapet/pkg/refs"
 	"github.com/bubustack/bobrapet/pkg/storage"
 	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
 	grpc_metrics "github.com/bubustack/bobravoz-grpc/pkg/metrics"
+	"github.com/bubustack/core/contracts"
+	bootstrapruntime "github.com/bubustack/core/runtime/bootstrap"
+	identity "github.com/bubustack/core/runtime/identity"
+	stagemeta "github.com/bubustack/core/runtime/stage"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/go-logr/logr"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
@@ -285,13 +288,36 @@ func cloneBinaryFrame(src *transportpb.BinaryFrame) *transportpb.BinaryFrame {
 	return cloned
 }
 
+func cloneStruct(src *structpb.Struct) *structpb.Struct {
+	if src == nil {
+		return nil
+	}
+	cloned, ok := proto.Clone(src).(*structpb.Struct)
+	if !ok {
+		return src
+	}
+	return cloned
+}
+
+// startHeartbeatSender reads BUBU_GRPC_HEARTBEAT_INTERVAL (default 10s), logs
+// the effective cadence, and runs a ticker goroutine that calls
+// streamManager.SendHeartbeats until the provided context is canceled
+// (`internal/hub/server.go:299-335`).
 func (s *Server) startHeartbeatSender(ctx context.Context) {
 	interval := 10 * time.Second // Default interval, matches SDK
+	overrideSource := "default"
 	if v := os.Getenv(contracts.GRPCHeartbeatIntervalEnv); v != "" {
 		if d, err := time.ParseDuration(v); err == nil && d > 0 {
 			interval = d
+			overrideSource = fmt.Sprintf("env:%s", contracts.GRPCHeartbeatIntervalEnv)
+		} else if err != nil {
+			s.log.Error(err, "Invalid heartbeat interval override, using default", "value", v)
+		} else {
+			s.log.Info("Ignoring non-positive heartbeat interval override", "value", v)
 		}
 	}
+	s.log.Info("Starting heartbeat sender", "interval", interval.String(), "overrideSource", overrideSource)
+	grpc_metrics.RecordHubHeartbeatInterval(interval)
 
 	ticker := time.NewTicker(interval)
 	go func() {
@@ -306,7 +332,10 @@ func (s *Server) startHeartbeatSender(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				s.streamManager.SendHeartbeats(ctx)
+				if err := s.streamManager.SendHeartbeats(ctx); err != nil {
+					grpc_metrics.RecordHubHeartbeatFailure()
+					s.log.Error(err, "Failed to broadcast heartbeat batch")
+				}
 			}
 		}
 	}()
@@ -316,6 +345,8 @@ func (s *Server) startHeartbeatSender(ctx context.Context) {
 func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	s.log.Info("New stream established")
 	ctx := stream.Context()
+	streamContract := bootstrapruntime.NewContractLogger(s.log, "hub").WithComponent("stream")
+	streamContract.Start("register")
 	// Apply a stream-wide deadline only when upstream didn't supply one.
 	if s.perMessageTimeout > 0 {
 		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
@@ -330,6 +361,7 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	if !ok {
 		err := errors.New("missing metadata")
 		s.log.Error(err, "Incoming hub stream missing metadata")
+		streamContract.Failure("register", err)
 		return err
 	}
 	s.log.Info("Incoming stream metadata snapshot", "metadata", md)
@@ -337,27 +369,25 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	storyRunName, storyRunNS, currentStepID, err := s.extractMetadata(md)
 	if err != nil {
 		s.log.Error(err, "Failed to extract metadata")
+		streamContract.Failure("register", err)
 		return err
 	}
-	s.log.Info("Hub stream metadata extracted",
-		"storyRun", storyRunName,
-		"namespace", storyRunNS,
-		"step", currentStepID,
-	)
+	meta := stagemeta.StoryRunMetadata(storyRunName, storyRunNS).WithStep(currentStepID)
+	meta.Info(s.log, "Hub stream metadata extracted")
 
+	meta.Info(s.log, "Registering stream")
 	streamEntry := s.streamManager.AddStream(ctx, storyRunName, storyRunNS, currentStepID, stream)
-	s.log.Info("Hub stream metadata",
-		"storyRun", storyRunName,
-		"namespace", storyRunNS,
-		"step", currentStepID,
-	)
+	meta.Info(s.log, "Hub stream registered successfully")
 	defer s.streamManager.RemoveStream(storyRunName, storyRunNS, currentStepID, streamEntry)
+	streamContract = streamContract.WithStage(meta)
+	streamContract.Success("register")
 
 	// Handle incoming messages in this goroutine and return when the stream ends
-	if err := s.messageLoop(ctx, stream, storyRunName, storyRunNS, currentStepID); err != nil {
+	loopContract := bootstrapruntime.NewContractLogger(s.log, "hub").WithComponent("messageLoop").WithStage(meta)
+	if err := s.messageLoop(ctx, stream, meta, loopContract); err != nil {
 		return err
 	}
-	s.log.Info("Stream ended", "storyRun", storyRunName, "step", currentStepID)
+	meta.Info(s.log, "Stream ended")
 	return nil
 }
 
@@ -367,7 +397,20 @@ type recvResult struct {
 	err error
 }
 
-func (s *Server) messageLoop(ctx context.Context, stream transportpb.HubService_ProcessServer, storyRunName, storyRunNS, currentStepID string) error {
+// messageLoop serializes hub Process() traffic by feeding stream.Recv results
+// through a single worker, ignores empty wrappers and heartbeats (while still
+// recording metrics), and calls processPacket for each payload until the
+// context is canceled or the client closes the stream
+// (`internal/hub/server.go:382-452`).
+func (s *Server) messageLoop(ctx context.Context, stream transportpb.HubService_ProcessServer, meta stagemeta.Metadata, contract bootstrapruntime.ContractLogger) (err error) {
+	contract.Start("loop")
+	defer func() {
+		if err != nil {
+			contract.Failure("loop", err)
+		} else {
+			contract.Success("loop")
+		}
+	}()
 	// Start a single receiver goroutine that feeds into recvCh
 	// This prevents unbounded goroutine creation on each recv attempt
 	recvCh := make(chan recvResult, 1)
@@ -393,46 +436,55 @@ func (s *Server) messageLoop(ctx context.Context, stream transportpb.HubService_
 	for {
 		select {
 		case <-ctx.Done():
-			s.log.Info("Stream context done", "storyRun", storyRunName, "step", currentStepID, "err", ctx.Err())
-			err := ctx.Err()
+			meta.Info(s.log, "Stream context done", "err", ctx.Err())
+			err = ctx.Err()
 			if errors.Is(err, context.DeadlineExceeded) {
-				s.log.Info("Stream deadline exceeded", "storyRun", storyRunName, "step", currentStepID)
-				return status.Errorf(codes.DeadlineExceeded, "hub stream deadline exceeded: %v", err)
+				meta.Info(s.log, "Stream deadline exceeded")
+				err = status.Errorf(codes.DeadlineExceeded, "hub stream deadline exceeded: %v", err)
 			}
-			s.log.Info("Stream context done, closing message loop", "storyRun", storyRunName, "step", currentStepID)
+			meta.Info(s.log, "Stream context done, closing message loop")
 			return err
 
 		case result, ok := <-recvCh:
 			if !ok {
 				// Channel closed unexpectedly
-				s.log.Info("recvCh closed unexpectedly", "storyRun", storyRunName, "step", currentStepID)
-				return io.EOF
+				meta.Info(s.log, "recvCh closed unexpectedly")
+				err = io.EOF
+				return err
 			}
 
 			if result.err != nil {
 				if result.err == io.EOF {
-					s.log.Info("Upstream closed the stream", "storyRun", storyRunName, "step", currentStepID)
-					return nil
+					meta.Info(s.log, "Upstream closed the stream")
+					err = nil
+					return err
 				}
-				s.log.Error(result.err, "Error receiving from stream", "storyRun", storyRunName, "step", currentStepID)
-				return result.err
+				meta.Error(s.log, result.err, "Error receiving from stream")
+				err = result.err
+				return err
 			}
 
 			packet := result.req.GetPacket()
 			if packet == nil {
-				s.log.Info("Received empty packet wrapper", "storyRun", storyRunName, "step", currentStepID)
+				meta.Info(s.log, "Received empty packet wrapper")
 				continue // ignore empty wrapper
 			}
-			s.log.Info("Received packet from hub", "storyRun", storyRunName, "step", currentStepID, "metadataKeys", len(packet.Metadata))
+			metadataCount := len(packet.Metadata)
+			meta.Info(s.log, "Received packet from hub", "metadataKeys", metadataCount)
 
 			if !isHeartbeat(packet) {
-				grpc_metrics.RecordHubMessageReceived(storyRunName, currentStepID)
+				grpc_metrics.RecordHubMessageReceived(meta.StoryRun, meta.Step)
 			} else {
-				s.log.V(1).Info("Heartbeat received", "storyRun", storyRunName, "step", currentStepID)
+				grpc_metrics.RecordHubHeartbeat(meta.StoryRun, meta.Step)
+				meta.Info(s.log.V(1), "Heartbeat received")
 			}
 
 			// Process the packet (may be slow due to K8s API calls)
-			if err := s.processPacket(ctx, storyRunName, storyRunNS, currentStepID, packet); err != nil {
+			if err := s.processPacket(ctx, meta.StoryRun, meta.Namespace, meta.Step, packet); err != nil {
+				meta.Info(s.log, "processPacket failed",
+					"metadataCount", metadataCount,
+					"severity", "warn",
+				)
 				return err
 			}
 		}
@@ -447,7 +499,7 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 		return status.Errorf(codes.Unavailable, "failed to get story backend data: %v", err)
 	}
 
-	primitiveSteps, nextEngramStep, err := findNextSteps(story, currentStepID)
+	primitiveSteps, nextEngramStep, hotTransport, err := findNextSteps(story, currentStepID)
 	if err != nil {
 		if strings.Contains(err.Error(), "last step") {
 			s.log.Info("End of pipeline reached for packet", "storyRun", storyRunName, "lastStep", currentStepID)
@@ -456,6 +508,13 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 		}
 		return nil
 	}
+
+	// Debug logging for routing
+	nextStepName := "<none>"
+	if nextEngramStep != nil {
+		nextStepName = getStepID(nextEngramStep)
+	}
+	s.log.Info("Routing packet via DAG", "storyRun", storyRunName, "from", currentStepID, "to", nextStepName, "primitiveSteps", len(primitiveSteps))
 
 	storyInputs, inputsErr := rawExtensionToMap(storyRun.Spec.Inputs)
 	if inputsErr != nil {
@@ -467,6 +526,11 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 	}
 
 	s.log.Info("Received packet", "storyRun", storyRunName, "fromStep", currentStepID)
+
+	if hotTransport && len(primitiveSteps) == 0 && !requiresDynamicInputs(nextEngramStep) {
+		s.log.Info("Delivering packet via hot transport bypass", "storyRun", storyRunName, "from", currentStepID, "to", getStepID(nextEngramStep))
+		return s.forwardHotPacket(ctx, storyRun, nextEngramStep, in)
+	}
 
 	processedPayload, stepVars, recorded, err := s.evaluatePrimitiveChain(ctx, storyRunName, currentStepID, primitiveSteps, in, storyInputs)
 	if err != nil {
@@ -517,8 +581,13 @@ func (s *Server) evaluatePrimitiveChain(
 	storyInputs map[string]any,
 ) (*structpb.Struct, map[string]any, bool, error) {
 	stepVars, recorded := setStepOutputs(nil, currentStepID, packet.Payload, packet.Inputs)
-	if !recorded {
-		s.log.V(1).Info("Packet produced no outputs; skipping downstream evaluation",
+
+	// Media packets (Audio/Video/Binary) are valid even without Payload/Inputs
+	// They carry data in their respective fields, not in the Payload field
+	hasMediaData := packet.GetAudio() != nil || packet.GetVideo() != nil || packet.GetBinary() != nil
+
+	if !recorded && !hasMediaData {
+		s.log.V(1).Info("Packet produced no outputs and has no media data; skipping downstream evaluation",
 			"storyRun", storyRunName,
 			"step", currentStepID,
 		)
@@ -659,6 +728,26 @@ func (s *Server) forwardToRealtimeStep(
 	originalPacket *transportpb.DataPacket,
 ) error {
 	nextEngramStepID := getStepID(nextEngramStep)
+
+	// Debug logging for packet contents
+	hasAudio := originalPacket.GetAudio() != nil
+	hasVideo := originalPacket.GetVideo() != nil
+	hasBinary := originalPacket.GetBinary() != nil
+	audioLen := 0
+	if hasAudio {
+		audioLen = len(originalPacket.GetAudio().GetPcm())
+	}
+	s.log.Info("Hub forwarding packet",
+		"storyRun", storyRun.Name,
+		"to", nextEngramStepID,
+		"hasAudio", hasAudio,
+		"audioPcmLen", audioLen,
+		"hasVideo", hasVideo,
+		"hasBinary", hasBinary,
+		"hasPayload", payload != nil,
+		"hasInputs", evaluatedInputs != nil,
+	)
+
 	out := &transportpb.DataPacket{
 		Metadata:   copyMetadataForStep(originalPacket.Metadata, storyRun.Name, storyRun.Namespace, nextEngramStepID),
 		Payload:    payload,
@@ -673,6 +762,45 @@ func (s *Server) forwardToRealtimeStep(
 		return status.Errorf(codes.ResourceExhausted, "downstream buffer full for step %q", nextEngramStepID)
 	}
 	return nil
+}
+
+func (s *Server) forwardHotPacket(
+	ctx context.Context,
+	storyRun *runsv1alpha1.StoryRun,
+	nextEngramStep *bubuv1alpha1.Step,
+	originalPacket *transportpb.DataPacket,
+) error {
+	if nextEngramStep == nil {
+		return nil
+	}
+	nextEngramStepID := getStepID(nextEngramStep)
+	out := &transportpb.DataPacket{
+		Metadata:   copyMetadataForStep(originalPacket.Metadata, storyRun.Name, storyRun.Namespace, nextEngramStepID),
+		Payload:    cloneStruct(originalPacket.GetPayload()),
+		Inputs:     cloneStruct(originalPacket.GetInputs()),
+		Transports: cloneTransports(originalPacket.GetTransports()),
+		Audio:      cloneAudioFrame(originalPacket.GetAudio()),
+		Video:      cloneVideoFrame(originalPacket.GetVideo()),
+		Binary:     cloneBinaryFrame(originalPacket.GetBinary()),
+	}
+	if ok := s.streamManager.SendOrBuffer(ctx, storyRun.Name, storyRun.Namespace, nextEngramStepID, out); !ok {
+		s.log.Info("Failed to deliver or buffer hot-path packet; dropping", "storyRun", storyRun.Name, "downstreamStep", nextEngramStepID)
+		return status.Errorf(codes.ResourceExhausted, "downstream buffer full for step %q", nextEngramStepID)
+	}
+	return nil
+}
+
+func requiresDynamicInputs(step *bubuv1alpha1.Step) bool {
+	if step == nil {
+		return false
+	}
+	if step.Runtime != nil && len(step.Runtime.Raw) > 0 {
+		return true
+	}
+	if step.With != nil && len(step.With.Raw) > 0 {
+		return true
+	}
+	return false
 }
 
 // getStoryAndRunWithRetry fetches StoryRun and Story with exponential backoff for transient errors.
@@ -884,15 +1012,14 @@ func (s *Server) createBatchStepRun(ctx context.Context, storyRun *runsv1alpha1.
 	stepID := getStepID(step)
 	name := generateStepRunName(storyRun.Name, stepID, time.Now())
 
+	labels := identity.StoryRunSelectorLabels(storyRun.Name)
+	labels[contracts.StoryNameLabelKey] = story.Name
+	labels["bubustack.io/hybrid"] = trueString
 	stepRun := &runsv1alpha1.StepRun{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: storyRun.Namespace,
-			Labels: map[string]string{
-				"bubustack.io/storyrun":   storyRun.Name,
-				"bubustack.io/story-name": story.Name,
-				"bubustack.io/hybrid":     trueString,
-			},
+			Labels:    labels,
 			Annotations: map[string]string{
 				"bubustack.io/upstream-step": upstreamStepID,
 			},
@@ -946,10 +1073,25 @@ func (s *Server) evaluatePrimitive(ctx context.Context, step *bubuv1alpha1.Step,
 }
 
 func (s *Server) evaluateEngramInputs(ctx context.Context, step *bubuv1alpha1.Step, payload *structpb.Struct, steps map[string]any, storyInputs map[string]any) (*structpb.Struct, error) {
-	if step == nil || step.With == nil {
+	if step == nil {
 		return nil, nil
 	}
-	return s.evaluateWithBlock(ctx, step.With.Raw, buildCELVars(payload, storyInputs, steps))
+
+	// For realtime steps with runtime field, evaluate runtime configuration per-packet
+	// This allows dynamic config referencing other step outputs
+	if step.Runtime != nil && len(step.Runtime.Raw) > 0 {
+		vars := buildRuntimeCELVars(payload, storyInputs, steps)
+		return s.evaluateWithBlock(ctx, step.Runtime.Raw, vars)
+	}
+
+	// For batch steps or steps without runtime field, evaluate with block
+	// This is the legacy/batch behavior
+	if step.With != nil {
+		vars := buildCELVars(payload, storyInputs, steps)
+		return s.evaluateWithBlock(ctx, step.With.Raw, vars)
+	}
+
+	return nil, nil
 }
 
 func (s *Server) evaluateWithBlock(ctx context.Context, raw json.RawMessage, vars map[string]any) (*structpb.Struct, error) {
@@ -1062,6 +1204,52 @@ func buildCELVars(payload *structpb.Struct, storyInputs map[string]any, steps ma
 	return vars
 }
 
+// buildRuntimeCELVars constructs the CEL evaluation context for runtime field evaluation.
+// This is used for realtime/streaming steps where configuration needs to reference
+// other step outputs on a per-packet basis.
+//
+// Available contexts:
+//   - steps.*: Direct access to other step outputs (e.g., steps.transcribe.text)
+//   - inputs.*: Story inputs (static, from StoryRun.Spec.Inputs)
+//   - packet.*: Current packet payload data
+func buildRuntimeCELVars(payload *structpb.Struct, storyInputs map[string]any, stepsRaw map[string]any) map[string]any {
+	payloadMap := payloadAsMap(payload)
+	vars := map[string]any{
+		"packet": payloadMap,  // Current packet data
+		"inputs": storyInputs, // Story inputs
+	}
+
+	if len(stepsRaw) > 0 {
+		vars["steps"] = flattenStepOutputs(stepsRaw) // Flattened step outputs
+	}
+
+	return vars
+}
+
+// flattenStepOutputs extracts step outputs from the accumulated step variables
+// and provides direct access without the .outputs nesting.
+//
+// Input format: steps["transcribe"] = {"outputs": {"text": "hello", "model": "gpt-4"}}
+// Output format: steps["transcribe"] = {"text": "hello", "model": "gpt-4"}
+//
+// This allows cleaner CEL expressions:
+//
+//	{{ steps.transcribe.text }}
+func flattenStepOutputs(stepsRaw map[string]any) map[string]any {
+	flattened := make(map[string]any)
+
+	for stepID, stepData := range stepsRaw {
+		if stepMap, ok := stepData.(map[string]any); ok {
+			if outputs, ok := stepMap["outputs"]; ok {
+				// Flatten: steps.stepID = outputs (without .outputs wrapper)
+				flattened[stepID] = outputs
+			}
+		}
+	}
+
+	return flattened
+}
+
 func mergeMaps(primary, secondary map[string]any) map[string]any {
 	if len(primary) == 0 && len(secondary) == 0 {
 		return map[string]any{}
@@ -1089,25 +1277,49 @@ func (s *Server) extractMetadata(md metadata.MD) (storyRunName, storyRunNS, curr
 	return md[metaStoryRunName][0], md[metaStoryRunNS][0], md[metaCurrentStepID][0], nil
 }
 
-func findNextSteps(story *bubuv1alpha1.Story, currentStepID string) (nextSteps []*bubuv1alpha1.Step, nextEngramStep *bubuv1alpha1.Step, err error) {
-	startIndex := -1
-	for i, step := range story.Spec.Steps {
-		if getStepID(&step) == currentStepID {
-			startIndex = i
+func findNextSteps(story *bubuv1alpha1.Story, currentStepID string) (nextSteps []*bubuv1alpha1.Step, nextEngramStep *bubuv1alpha1.Step, hotTransport bool, err error) {
+	if story == nil {
+		return nil, nil, false, fmt.Errorf("story is nil")
+	}
+
+	stepIndex := -1
+	for i := range story.Spec.Steps {
+		if getStepID(&story.Spec.Steps[i]) == currentStepID {
+			stepIndex = i
+			break
+		}
+	}
+	if stepIndex == -1 {
+		return nil, nil, false, fmt.Errorf("step %q not found in story", currentStepID)
+	}
+	if stepIndex+1 >= len(story.Spec.Steps) {
+		return nil, nil, false, errors.New("current step is the last step")
+	}
+
+	currentStep := &story.Spec.Steps[stepIndex]
+	currentTransport := currentStep.Transport
+	hotTransport = isHotTransport(story, currentTransport)
+
+	var downstream []*bubuv1alpha1.Step
+	for i := stepIndex + 1; i < len(story.Spec.Steps); i++ {
+		step := &story.Spec.Steps[i]
+		if !dependsOnStep(step, currentStepID) {
+			continue
+		}
+		if currentTransport != "" && step.Transport != currentTransport {
+			continue
+		}
+		downstream = append(downstream, step)
+		if step.Ref != nil {
 			break
 		}
 	}
 
-	if startIndex == -1 {
-		return nil, nil, fmt.Errorf("step %q not found in story", currentStepID)
+	if len(downstream) == 0 {
+		return nil, nil, hotTransport, errors.New("current step is the last step")
 	}
 
-	if startIndex+1 >= len(story.Spec.Steps) {
-		return nil, nil, errors.New("current step is the last step")
-	}
-
-	for i := startIndex + 1; i < len(story.Spec.Steps); i++ {
-		step := &story.Spec.Steps[i]
+	for _, step := range downstream {
 		if step.Ref != nil {
 			nextEngramStep = step
 			break
@@ -1115,7 +1327,7 @@ func findNextSteps(story *bubuv1alpha1.Story, currentStepID string) (nextSteps [
 		nextSteps = append(nextSteps, step)
 	}
 
-	return nextSteps, nextEngramStep, nil
+	return nextSteps, nextEngramStep, hotTransport, nil
 }
 
 func getStepID(step *bubuv1alpha1.Step) string {
@@ -1123,4 +1335,36 @@ func getStepID(step *bubuv1alpha1.Step) string {
 		return step.ID
 	}
 	return step.Name
+}
+
+func isHotTransport(story *bubuv1alpha1.Story, transportName string) bool {
+	if story == nil || transportName == "" {
+		return false
+	}
+	for _, status := range story.Status.Transports {
+		if status.Name != transportName {
+			continue
+		}
+		mode := status.Mode
+		if mode == "" {
+			mode = enums.TransportModeHot
+		}
+		return mode == enums.TransportModeHot
+	}
+	return false
+}
+
+func dependsOnStep(step *bubuv1alpha1.Step, currentStepID string) bool {
+	if step == nil {
+		return false
+	}
+	if len(step.Needs) == 0 {
+		return true
+	}
+	for _, need := range step.Needs {
+		if need == currentStepID {
+			return true
+		}
+	}
+	return false
 }

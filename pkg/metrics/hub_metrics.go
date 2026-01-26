@@ -19,9 +19,10 @@ package metrics
 import (
 	"os"
 	"strconv"
+	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	bobrapetmetrics "github.com/bubustack/bobrapet/pkg/metrics"
+	"github.com/bubustack/core/contracts"
 	"github.com/prometheus/client_golang/prometheus"
 	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 )
@@ -80,6 +81,28 @@ var (
 			Help: "Configured maximum total bytes buffered per downstream engram (per pod)",
 		},
 	)
+
+	hubHeartbeatIntervalGauge = prometheus.NewGauge(
+		prometheus.GaugeOpts{
+			Name: "bobravoz_hub_heartbeat_interval_seconds",
+			Help: "Configured heartbeat interval in seconds for hub-to-connector keepalives.",
+		},
+	)
+
+	hubHeartbeatFailureCounter = prometheus.NewCounter(
+		prometheus.CounterOpts{
+			Name: "bobravoz_hub_heartbeat_failures_total",
+			Help: "Monotonic counter tracking SendHeartbeats errors.",
+		},
+	)
+
+	hubHeartbeatsReceivedCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bobravoz_hub_heartbeats_received_total",
+			Help: "Total number of heartbeat packets received on hub streams.",
+		},
+		[]string{"storyrun", "step"},
+	)
 )
 
 func init() {
@@ -91,6 +114,9 @@ func init() {
 		hubBufferBytesGauge,
 		hubBufferMaxMessagesGauge,
 		hubBufferMaxBytesGauge,
+		hubHeartbeatIntervalGauge,
+		hubHeartbeatFailureCounter,
+		hubHeartbeatsReceivedCounter,
 	)
 	// Initialize config gauges from environment (best-effort; defaults if unset)
 	// Keep logic independent from internal packages to avoid import cycles
@@ -136,9 +162,24 @@ func RecordHubMessageReceived(storyRun, step string) {
 	bobrapetmetrics.RecordGRPCMessageReceived(storyRun, step)
 }
 
+// RecordHubHeartbeat records a heartbeat packet received on the stream.
+func RecordHubHeartbeat(storyRun, step string) {
+	hubHeartbeatsReceivedCounter.WithLabelValues(storyRun, step).Inc()
+}
+
 // RecordHubMessageSent records a message successfully sent from the hub
 func RecordHubMessageSent(storyRun, step string) {
 	bobrapetmetrics.RecordGRPCMessageSent(storyRun, step)
+}
+
+// RecordHubHeartbeatInterval records the currently effective heartbeat interval.
+func RecordHubHeartbeatInterval(interval time.Duration) {
+	hubHeartbeatIntervalGauge.Set(interval.Seconds())
+}
+
+// RecordHubHeartbeatFailure increments the failure counter when SendHeartbeats fails.
+func RecordHubHeartbeatFailure() {
+	hubHeartbeatFailureCounter.Inc()
 }
 
 // Example HPA configuration for cluster admins:

@@ -1,5 +1,8 @@
 # Image URL to use all building/pushing image targets
 IMG ?= bobravoz-grpc:latest
+CONNECTOR_IMG ?= bobravoz-grpc-connector:latest
+CHART ?= bobravoz-grpc
+CHART_OVERRIDE_DIR ?= hack/charts
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -122,6 +125,14 @@ docker-build: ## Build docker image with the manager.
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
+.PHONY: docker-build-connector
+docker-build-connector: ## Build docker image with the LiveKit connector.
+	$(CONTAINER_TOOL) build -t ${CONNECTOR_IMG} -f Dockerfile.connector.local ../
+
+.PHONY: docker-push-connector
+docker-push-connector: ## Push the connector image.
+	$(CONTAINER_TOOL) push ${CONNECTOR_IMG}
+
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
 # - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
@@ -139,11 +150,31 @@ docker-buildx: ## Build and push docker image for the manager for cross-platform
 	- $(CONTAINER_TOOL) buildx rm bobravoz-grpc-builder
 	rm Dockerfile.cross
 
+.PHONY: docker-buildx-connector
+docker-buildx-connector: ## Build and push the connector image for cross-platform support
+	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile.connector > Dockerfile.connector.cross
+	- $(CONTAINER_TOOL) buildx create --name bobravoz-connector-builder
+	$(CONTAINER_TOOL) buildx use bobravoz-connector-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${CONNECTOR_IMG} -f Dockerfile.connector.cross .
+	- $(CONTAINER_TOOL) buildx rm bobravoz-connector-builder
+	rm Dockerfile.connector.cross
+
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && $(KUSTOMIZE) edit set image controller=${IMG}
 	$(KUSTOMIZE) build config/default > dist/install.yaml
+
+##@ Helm
+
+.PHONY: helm-chart
+helm-chart: helmify kustomize ## Generate Helm chart via helmify (override CHART=<name> if needed)
+	rm -rf dist/charts/$(CHART)
+	mkdir -p dist/charts
+	$(KUSTOMIZE) build config/default | $(HELMIFY) -crd-dir dist/charts/$(CHART)
+	if [ -d $(CHART_OVERRIDE_DIR)/$(CHART) ]; then \
+		cp -R $(CHART_OVERRIDE_DIR)/$(CHART)/. dist/charts/$(CHART)/; \
+	fi
 
 ##@ Deployment
 
@@ -184,6 +215,7 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+HELMIFY ?= $(LOCALBIN)/helmify
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.7.1
@@ -193,6 +225,7 @@ ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= v2.4.0
+HELMIFY_VERSION ?= v0.4.19
 
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
@@ -221,6 +254,11 @@ $(ENVTEST): $(LOCALBIN)
 golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
 $(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
+
+.PHONY: helmify
+helmify: $(HELMIFY) ## Download helmify locally if necessary.
+$(HELMIFY): $(LOCALBIN)
+	$(call go-install-tool,$(HELMIFY),github.com/arttor/helmify/cmd/helmify,$(HELMIFY_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary

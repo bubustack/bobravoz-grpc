@@ -2,34 +2,29 @@ package connector
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"net"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
+	"github.com/bubustack/bobravoz-grpc/pkg/metrics"
+	transportconnector "github.com/bubustack/core/runtime/transport/connector"
 	"github.com/bubustack/tractatus/envelope"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/connectivity"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/structpb"
 )
 
@@ -43,11 +38,7 @@ const (
 	metadataEnvelopeTimeKey      = "bubu.envelope.timestamp_ms"
 )
 
-type runtimeTunables struct {
-	messageTimeout     time.Duration
-	channelSendTimeout time.Duration
-	hangTimeout        time.Duration
-}
+type runtimeTunables = transportconnector.RuntimeTunables
 
 // Runner hosts the TransportConnector gRPC server and bridges frames to the hub.
 type Runner struct {
@@ -62,7 +53,7 @@ func NewRunner(cfg *Config, log logr.Logger) *Runner {
 
 // Run starts the gRPC server and blocks until the context is cancelled.
 func (r *Runner) Run(ctx context.Context) error {
-	listener, err := listenEndpoint(r.cfg.LocalEndpoint)
+	listener, err := transportconnector.ListenLocalEndpoint(r.cfg.LocalEndpoint)
 	if err != nil {
 		return err
 	}
@@ -72,11 +63,10 @@ func (r *Runner) Run(ctx context.Context) error {
 		}
 	}()
 
-	tunables := runtimeTunables{
-		messageTimeout:     messageTimeoutFromEnv(),
-		channelSendTimeout: channelSendTimeoutFromEnv(),
-		hangTimeout:        hangTimeoutFromEnv(),
-	}
+	tunables := transportconnector.RuntimeTunablesFromEnv(
+		transportconnector.OSEnv,
+		transportconnector.RuntimeTunables{},
+	)
 
 	bridge, err := newHubBridge(ctx, r.cfg, r.log, tunables)
 	if err != nil {
@@ -88,7 +78,11 @@ func (r *Runner) Run(ctx context.Context) error {
 	if telemetry.TracePropagationEnabled() {
 		opts = append(opts, grpc.StatsHandler(otelgrpc.NewServerHandler()))
 	}
-	opts = append(opts, serverOptionsFromEnv()...)
+	opts = append(opts, transportconnector.ServerOptions(
+		transportconnector.OSEnv,
+		transportconnector.DefaultMaxMessageSize,
+		transportconnector.DefaultMaxMessageSize,
+	)...)
 	server := grpc.NewServer(opts...)
 	transportpb.RegisterTransportConnectorServer(server, newTransportServer(ctx, r.cfg, r.log, bridge, tunables))
 
@@ -106,29 +100,6 @@ func (r *Runner) Run(ctx context.Context) error {
 	case err := <-errCh:
 		return err
 	}
-}
-
-func listenEndpoint(endpoint string) (net.Listener, error) {
-	if strings.HasPrefix(endpoint, "unix://") {
-		path := strings.TrimPrefix(endpoint, "unix://")
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-			return nil, fmt.Errorf("failed to create unix socket dir: %w", err)
-		}
-		_ = os.Remove(path)
-		lis, err := net.Listen("unix", path)
-		if err != nil {
-			return nil, fmt.Errorf("failed to listen on unix socket %s: %w", path, err)
-		}
-		return lis, nil
-	}
-	if !strings.Contains(endpoint, ":") {
-		endpoint = fmt.Sprintf("0.0.0.0:%s", endpoint)
-	}
-	lis, err := net.Listen("tcp", endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("failed to listen on %s: %w", endpoint, err)
-	}
-	return lis, nil
 }
 
 type transportServer struct {
@@ -155,6 +126,29 @@ func newTransportServer(ctx context.Context, cfg *Config, log logr.Logger, bridg
 	}
 }
 
+func (s *transportServer) bindingLabels() (string, string) {
+	if s == nil || s.cfg == nil {
+		return "", ""
+	}
+	return s.cfg.Binding.Reference.Namespace, s.cfg.Binding.Reference.Name
+}
+
+func (s *transportServer) recordDownstreamDrop(reason string) {
+	ns, binding := s.bindingLabels()
+	if ns == "" && binding == "" {
+		return
+	}
+	metrics.RecordConnectorDownstreamDrop(ns, binding, reason)
+}
+
+func (s *transportServer) recordControlDirective(direction, directiveType string) {
+	ns, binding := s.bindingLabels()
+	if ns == "" && binding == "" {
+		return
+	}
+	metrics.RecordConnectorControlDirective(ns, binding, direction, normalizeDirectiveType(directiveType))
+}
+
 func (s *transportServer) reportReady(_ context.Context) {
 	if s.reporter == nil {
 		return
@@ -169,13 +163,13 @@ func (s *transportServer) Publish(stream transportpb.TransportConnector_PublishS
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	var watcher *hangWatcher
-	if s.tunables.hangTimeout > 0 {
-		watcher = newHangWatcher(s.tunables.hangTimeout, cancel, s.log.WithName("publish-hang"))
+	if s.tunables.HangTimeout > 0 {
+		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("publish-hang"))
 		defer watcher.Stop()
 	}
 	s.reportReady(ctx)
 	for {
-		req, err := recvWithTimeout(ctx, s.tunables.messageTimeout, cancel, "publish recv", stream.Recv)
+		req, err := transportconnector.RecvWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "publish recv", stream.Recv)
 		if err != nil {
 			if status.Code(err) == status.Code(context.Canceled) || err == context.Canceled {
 				return err
@@ -188,11 +182,39 @@ func (s *transportServer) Publish(stream transportpb.TransportConnector_PublishS
 			}
 			return err
 		}
+
+		// Log what the SDK is sending
+		hasAudio := req.GetAudio() != nil
+		hasVideo := req.GetVideo() != nil
+		hasBinary := req.GetBinary() != nil
+		audioPcmLen := 0
+		if hasAudio {
+			audioPcmLen = len(req.GetAudio().GetPcm())
+		}
+		s.log.Info("[CONNECTOR_PUBLISH] Received from local engram SDK",
+			"hasAudio", hasAudio,
+			"audioPcmLen", audioPcmLen,
+			"hasVideo", hasVideo,
+			"hasBinary", hasBinary)
+
 		s.recordCapabilitiesFromRequest(req)
 		packet, err := publishRequestToHubPacket(req)
 		if err != nil {
 			return err
 		}
+
+		// Log what we're sending to hub
+		hasAudioAfter := packet.GetAudio() != nil
+		audioPcmLenAfter := 0
+		if hasAudioAfter {
+			audioPcmLenAfter = len(packet.GetAudio().GetPcm())
+		}
+		s.log.Info("[CONNECTOR_PUBLISH] Sending to hub",
+			"hasAudio", hasAudioAfter,
+			"audioPcmLen", audioPcmLenAfter,
+			"hasPayload", packet.GetPayload() != nil,
+			"hasInputs", packet.GetInputs() != nil)
+
 		if !s.gate.AllowUpstream() {
 			s.log.V(1).Info("Upstream flow paused; dropping frame", "type", describeFrame(req))
 			continue
@@ -204,46 +226,64 @@ func (s *transportServer) Publish(stream transportpb.TransportConnector_PublishS
 			return err
 		}
 	}
-	return callWithTimeout(ctx, s.tunables.messageTimeout, cancel, "publish close", func() error {
+	return transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "publish close", func() error {
 		return stream.SendAndClose(&transportpb.PublishResponse{})
 	})
 }
 
+// Subscribe proxies packets from the hub bridge to the local Engram stream,
+// touching hang watchers, honoring AllowDownstream gating, and wrapping each
+// send in transportconnector.CallWithTimeout until the context is canceled or the bridge closes
+// (`internal/connector/connector.go:241-293`).
 func (s *transportServer) Subscribe(_ *transportpb.SubscribeRequest, stream transportpb.TransportConnector_SubscribeServer) error {
+	s.log.Info("Subscribe stream opened by local engram")
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	var watcher *hangWatcher
-	if s.tunables.hangTimeout > 0 {
-		watcher = newHangWatcher(s.tunables.hangTimeout, cancel, s.log.WithName("subscribe-hang"))
+	if s.tunables.HangTimeout > 0 {
+		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("subscribe-hang"))
 		defer watcher.Stop()
 	}
 	s.reportReady(ctx)
+	s.log.Info("Subscribe: waiting for packets from hub bridge")
 	for {
 		select {
 		case <-ctx.Done():
+			s.log.Info("Subscribe stream closed", "reason", ctx.Err())
 			return ctx.Err()
 		case packet, ok := <-s.bridge.Recv():
 			if !ok {
+				s.log.Info("Subscribe: hub bridge channel closed")
+				s.recordDownstreamDrop("bridge_closed")
 				return nil
 			}
-			msg, err := hubPacketToPublishRequest(packet)
+			s.log.Info("Subscribe: received packet from hub bridge, translating for engram", "metadataKeys", len(packet.Metadata))
+			msg, err := hubPacketToPublishRequest(s.log, packet)
 			if err != nil {
 				s.log.Error(err, "failed to translate hub packet")
 				continue
 			}
 			if msg == nil {
+				s.log.Info("Subscribe: translated packet is nil (heartbeat or empty), skipping")
+				if watcher != nil {
+					watcher.Touch()
+				}
 				continue
 			}
 			s.recordCapabilitiesFromRequest(msg)
 			if !s.gate.AllowDownstream() {
 				s.log.V(1).Info("Downstream flow paused; dropping frame", "type", describeFrame(msg))
+				s.recordDownstreamDrop("downstream_paused")
 				continue
 			}
-			if err := callWithTimeout(ctx, s.tunables.messageTimeout, cancel, "subscribe send", func() error {
+			s.log.Info("Subscribe: sending packet to local engram")
+			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "subscribe send", func() error {
 				return stream.Send(msg)
 			}); err != nil {
+				s.log.Error(err, "Subscribe: failed to send to engram")
 				return err
 			}
+			s.log.Info("Subscribe: packet sent to engram successfully")
 			if watcher != nil {
 				watcher.Touch()
 			}
@@ -251,16 +291,21 @@ func (s *transportServer) Subscribe(_ *transportpb.SubscribeRequest, stream tran
 	}
 }
 
+// Control establishes the connector control stream: it reports readiness,
+// sends an initial connector.ready directive, then concurrently forwards
+// capability updates and consumes directives with transportconnector.CallWithTimeout guarding
+// every send/recv until the context is canceled
+// (`internal/connector/connector.go:295-369`).
 func (s *transportServer) Control(stream transportpb.TransportConnector_ControlServer) error {
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
 	var watcher *hangWatcher
-	if s.tunables.hangTimeout > 0 {
-		watcher = newHangWatcher(s.tunables.hangTimeout, cancel, s.log.WithName("control-hang"))
+	if s.tunables.HangTimeout > 0 {
+		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("control-hang"))
 		defer watcher.Stop()
 	}
 	s.reportReady(ctx)
-	if err := callWithTimeout(ctx, s.tunables.messageTimeout, cancel, "control ready send", func() error {
+	if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control ready send", func() error {
 		return stream.Send(connectorReadyDirective())
 	}); err != nil {
 		return err
@@ -294,11 +339,13 @@ func (s *transportServer) forwardCapabilityUpdates(ctx context.Context, cancel c
 				return nil
 			}
 			if directive := capabilityStateToDirective(state); directive != nil {
-				if err := callWithTimeout(ctx, s.tunables.messageTimeout, cancel, "control capability send", func() error {
+				if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control capability send", func() error {
 					return stream.Send(directive)
 				}); err != nil {
 					return err
 				}
+				s.recordControlDirective("sent", directive.GetType())
+				s.log.V(1).Info("Control: forwarded capability directive", "type", directive.GetType())
 				if watcher != nil {
 					watcher.Touch()
 				}
@@ -315,19 +362,25 @@ func (s *transportServer) consumeControlDirectives(ctx context.Context, cancel c
 		default:
 		}
 
-		directive, err := recvWithTimeout(ctx, s.tunables.messageTimeout, cancel, "control recv", stream.Recv)
+		directive, err := transportconnector.RecvWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control recv", stream.Recv)
 		if err != nil {
 			if err == io.EOF || errors.Is(err, context.Canceled) {
 				return nil
 			}
 			return err
 		}
+		if directive != nil {
+			s.recordControlDirective("received", directive.GetType())
+			s.log.V(1).Info("Control: received directive", "type", directive.GetType())
+		}
 		if resp := s.handleControlDirective(ctx, directive); resp != nil {
-			if err := callWithTimeout(ctx, s.tunables.messageTimeout, cancel, "control send resp", func() error {
+			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control send resp", func() error {
 				return stream.Send(resp)
 			}); err != nil {
 				return err
 			}
+			s.recordControlDirective("sent", resp.GetType())
+			s.log.V(1).Info("Control: sent directive response", "type", resp.GetType())
 			if watcher != nil {
 				watcher.Touch()
 			}
@@ -377,11 +430,19 @@ func capabilityStateToDirective(state capabilityState) *transportpb.ControlDirec
 	}
 }
 
+func normalizeDirectiveType(val string) string {
+	typ := strings.ToLower(strings.TrimSpace(val))
+	if typ == "" {
+		return "unknown"
+	}
+	return typ
+}
+
 func (s *transportServer) handleControlDirective(ctx context.Context, directive *transportpb.ControlDirective) *transportpb.ControlDirective {
 	if directive == nil {
 		return nil
 	}
-	typ := strings.ToLower(strings.TrimSpace(directive.GetType()))
+	typ := normalizeDirectiveType(directive.GetType())
 	s.log.Info("Received control directive", "type", typ, "metadata", directive.GetMetadata())
 	switch typ {
 	case "", "noop":
@@ -480,8 +541,10 @@ type hubBridge struct {
 }
 
 func newHubBridge(ctx context.Context, cfg *Config, log logr.Logger, tunables runtimeTunables) (*hubBridge, error) {
+	log.Info("Connecting to hub", "endpoint", cfg.HubEndpoint, "step", cfg.StepID, "storyRun", cfg.StoryRunName)
 	conn, err := dialHub(ctx, cfg)
 	if err != nil {
+		log.Error(err, "Failed to dial hub", "endpoint", cfg.HubEndpoint)
 		return nil, err
 	}
 	md := metadata.Pairs(
@@ -493,10 +556,13 @@ func newHubBridge(ctx context.Context, cfg *Config, log logr.Logger, tunables ru
 	processCtx := metadata.NewOutgoingContext(streamCtx, md)
 	client, err := transportpb.NewHubServiceClient(conn).Process(processCtx)
 	if err != nil {
+		log.Error(err, "Failed to create hub stream", "endpoint", cfg.HubEndpoint)
 		streamCancel()
 		_ = conn.Close()
 		return nil, fmt.Errorf("connecting to hub: %w", err)
 	}
+
+	log.Info("Successfully connected to hub and registered stream", "step", cfg.StepID, "storyRun", cfg.StoryRunName)
 
 	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
 	cancelAll := func() {
@@ -508,37 +574,43 @@ func newHubBridge(ctx context.Context, cfg *Config, log logr.Logger, tunables ru
 		log:                log,
 		conn:               conn,
 		client:             client,
-		recvCh:             make(chan *transportpb.DataPacket, resolveChannelBufferSize()),
+		recvCh:             make(chan *transportpb.DataPacket, tunables.ChannelBufferSize),
 		ctx:                bridgeCtx,
 		cancel:             cancelAll,
-		messageTimeout:     tunables.messageTimeout,
-		channelSendTimeout: tunables.channelSendTimeout,
+		messageTimeout:     tunables.MessageTimeout,
+		channelSendTimeout: tunables.ChannelSendTimeout,
 	}
-	if tunables.hangTimeout > 0 {
-		hb.watcher = newHangWatcher(tunables.hangTimeout, cancelAll, log.WithName("hub-bridge"))
+	if tunables.HangTimeout > 0 {
+		hb.watcher = newHangWatcher(tunables.HangTimeout, cancelAll, log.WithName("hub-bridge"))
 	}
 	go hb.readLoop()
+	log.Info("Hub bridge read loop started", "step", cfg.StepID)
 	return hb, nil
 }
 
 func (b *hubBridge) readLoop() {
 	defer close(b.recvCh)
+	b.log.Info("Hub bridge readLoop started, waiting for packets from hub")
 	for {
-		response, err := recvWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub recv", b.client.Recv)
+		response, err := transportconnector.RecvWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub recv", b.client.Recv)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+				b.log.Info("Hub bridge readLoop exiting", "reason", err.Error())
 				return
 			}
 			b.log.Error(err, "hub stream recv failed")
 			return
 		}
 		if response == nil {
+			b.log.V(1).Info("Received nil response from hub")
 			continue
 		}
 		packet := response.GetPacket()
 		if packet == nil {
+			b.log.V(1).Info("Received response with nil packet from hub")
 			continue
 		}
+		b.log.Info("Received packet from hub, enqueueing for local engram", "metadataKeys", len(packet.Metadata))
 		if err := b.enqueuePacket(packet); err != nil {
 			b.log.Error(err, "failed to enqueue hub packet")
 			return
@@ -551,7 +623,7 @@ func (b *hubBridge) Send(packet *transportpb.DataPacket) error {
 	if packet == nil {
 		return nil
 	}
-	err := callWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub send", func() error {
+	err := transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub send", func() error {
 		b.sendMu.Lock()
 		defer b.sendMu.Unlock()
 		return b.client.Send(&transportpb.ProcessRequest{Packet: packet})
@@ -615,7 +687,7 @@ func dialHub(ctx context.Context, cfg *Config) (*grpc.ClientConn, error) {
 	}
 	if cfg.AllowInsecureHub {
 		opts = append(opts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-	} else if creds, err := hubCredentials(); err == nil {
+	} else if creds, err := transportconnector.HubCredentials(transportconnector.OSEnv); err == nil {
 		opts = append(opts, grpc.WithTransportCredentials(creds))
 	} else {
 		return nil, err
@@ -624,7 +696,11 @@ func dialHub(ctx context.Context, cfg *Config) (*grpc.ClientConn, error) {
 	if telemetry.TracePropagationEnabled() {
 		opts = append(opts, grpc.WithStatsHandler(otelgrpc.NewClientHandler()))
 	}
-	if callOpts := clientCallOptionsFromEnv(); len(callOpts) > 0 {
+	if callOpts := transportconnector.ClientCallOptions(
+		transportconnector.OSEnv,
+		transportconnector.DefaultMaxMessageSize,
+		transportconnector.DefaultMaxMessageSize,
+	); len(callOpts) > 0 {
 		opts = append(opts, grpc.WithDefaultCallOptions(callOpts...))
 	}
 
@@ -644,65 +720,57 @@ func dialHub(ctx context.Context, cfg *Config) (*grpc.ClientConn, error) {
 	}
 	defer cancel()
 
-	if err := waitForHubReady(waitCtx, conn); err != nil {
+	if err := transportconnector.WaitForReady(waitCtx, conn); err != nil {
 		_ = conn.Close()
 		return nil, fmt.Errorf("wait for hub readiness: %w", err)
 	}
 	return conn, nil
 }
 
-func waitForHubReady(ctx context.Context, conn *grpc.ClientConn) error {
-	for {
-		state := conn.GetState()
-		if state == connectivity.Ready {
-			return nil
-		}
-		conn.Connect()
-		if !conn.WaitForStateChange(ctx, state) {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			return fmt.Errorf("hub connection stuck in %s state", state)
-		}
-	}
-}
-
-func hubCredentials() (credentials.TransportCredentials, error) {
-	certFile := strings.TrimSpace(os.Getenv(contracts.GRPCClientCertFileEnv))
-	keyFile := strings.TrimSpace(os.Getenv(contracts.GRPCClientKeyFileEnv))
-	caFile := strings.TrimSpace(os.Getenv(contracts.GRPCAFileEnv))
-	if certFile == "" || keyFile == "" || caFile == "" {
-		return nil, fmt.Errorf("hub TLS assets not configured")
-	}
-	clientCert, err := tls.LoadX509KeyPair(certFile, keyFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to load hub TLS cert/key: %w", err)
-	}
-	caBytes, err := os.ReadFile(caFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read hub CA: %w", err)
-	}
-	caPool := x509.NewCertPool()
-	if !caPool.AppendCertsFromPEM(caBytes) {
-		return nil, fmt.Errorf("failed to parse hub CA")
-	}
-	return credentials.NewTLS(&tls.Config{
-		MinVersion: tls.VersionTLS12,
-		RootCAs:    caPool,
-		Certificates: []tls.Certificate{
-			clientCert,
-		},
-	}), nil
-}
-
 func publishRequestToHubPacket(req *transportpb.PublishRequest) (*transportpb.DataPacket, error) {
+	if req == nil {
+		return nil, fmt.Errorf("publish request is nil")
+	}
+	packet := &transportpb.DataPacket{
+		Metadata:   cloneStringMap(req.GetMetadata()),
+		Payload:    cloneStruct(req.GetPayload()),
+		Inputs:     cloneStruct(req.GetInputs()),
+		Transports: cloneTransportDescriptors(req.GetTransports()),
+	}
 	switch frame := req.GetFrame().(type) {
 	case *transportpb.PublishRequest_Audio:
-		return audioFrameToHubPacket(frame.Audio)
+		audioPacket, err := audioFrameToHubPacket(frame.Audio)
+		if err != nil {
+			return nil, err
+		}
+		packet.Audio = audioPacket.GetAudio()
+		return packet, nil
 	case *transportpb.PublishRequest_Video:
-		return videoFrameToHubPacket(frame.Video)
+		videoPacket, err := videoFrameToHubPacket(frame.Video)
+		if err != nil {
+			return nil, err
+		}
+		packet.Video = videoPacket.GetVideo()
+		return packet, nil
 	case *transportpb.PublishRequest_Binary:
-		return binaryFrameToHubPacket(frame.Binary)
+		binary := frame.Binary
+		if binary == nil {
+			return nil, fmt.Errorf("binary frame missing payload")
+		}
+		if strings.TrimSpace(binary.GetMimeType()) == envelope.MIMEType {
+			envPacket, err := binaryFrameToHubPacket(binary)
+			if err != nil {
+				return nil, err
+			}
+			mergeDataPackets(packet, envPacket)
+			return packet, nil
+		}
+		packet.Binary = &transportpb.BinaryFrame{
+			Payload:     append([]byte(nil), binary.GetPayload()...),
+			MimeType:    binary.GetMimeType(),
+			TimestampMs: binary.GetTimestampMs(),
+		}
+		return packet, nil
 	default:
 		return nil, fmt.Errorf("unsupported frame type %T", frame)
 	}
@@ -750,55 +818,105 @@ func binaryFrameToHubPacket(frame *transportpb.BinaryFrame) (*transportpb.DataPa
 	if err != nil {
 		return nil, fmt.Errorf("decode envelope: %w", err)
 	}
+	if env.TimestampMs == 0 && frame.GetTimestampMs() > 0 {
+		env.TimestampMs = int64(frame.GetTimestampMs())
+	}
+	// Envelope is transparent: unpack into DataPacket fields
+	// Do NOT keep the original binary frame - it's just a transport wrapper
 	packet := &transportpb.DataPacket{
 		Metadata:   cloneStringMap(env.Metadata),
 		Payload:    rawJSONToStruct(env.Payload),
 		Inputs:     rawJSONToStruct(env.Inputs),
 		Transports: convertEnvTransports(env.Transports),
-		Binary: &transportpb.BinaryFrame{
-			Payload:     append([]byte(nil), frame.GetPayload()...),
-			MimeType:    frame.GetMimeType(),
-			TimestampMs: frame.GetTimestampMs(),
-		},
 	}
 	injectEnvelopeHeaders(packet, env)
 	return packet, nil
 }
 
-func hubPacketToPublishRequest(packet *transportpb.DataPacket) (*transportpb.PublishRequest, error) {
+func mergeDataPackets(dst, src *transportpb.DataPacket) {
+	if dst == nil || src == nil {
+		return
+	}
+	if len(src.Metadata) > 0 {
+		if dst.Metadata == nil {
+			dst.Metadata = make(map[string]string, len(src.Metadata))
+		}
+		for k, v := range src.Metadata {
+			if _, exists := dst.Metadata[k]; !exists {
+				dst.Metadata[k] = v
+			}
+		}
+	}
+	if dst.Payload == nil && src.Payload != nil {
+		dst.Payload = cloneStruct(src.Payload)
+	}
+	if dst.Inputs == nil && src.Inputs != nil {
+		dst.Inputs = cloneStruct(src.Inputs)
+	}
+	if len(dst.Transports) == 0 && len(src.Transports) > 0 {
+		dst.Transports = cloneTransportDescriptors(src.Transports)
+	}
+}
+
+func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacket) (*transportpb.PublishRequest, error) {
 	if packet == nil {
 		return nil, nil
 	}
 
+	req := &transportpb.PublishRequest{
+		Metadata:   cloneStringMap(packet.Metadata),
+		Payload:    cloneStruct(packet.Payload),
+		Inputs:     cloneStruct(packet.Inputs),
+		Transports: cloneTransportDescriptors(packet.Transports),
+	}
+
+	// CRITICAL DEBUG: Log exactly what's in the packet
+	hasAudio := packet.Audio != nil
+	hasVideo := packet.Video != nil
+	hasBinary := packet.Binary != nil
+	hasPayload := packet.Payload != nil
+	hasInputs := packet.Inputs != nil
+	audioPcmLen := 0
+	if hasAudio {
+		audioPcmLen = len(packet.Audio.Pcm)
+	}
+	logger.Info("[CONNECTOR_TRANSLATE] hubPacketToPublishRequest",
+		"hasAudio", hasAudio,
+		"audioPcmLen", audioPcmLen,
+		"hasVideo", hasVideo,
+		"hasBinary", hasBinary,
+		"hasPayload", hasPayload,
+		"hasInputs", hasInputs)
+
 	if audio := packet.GetAudio(); audio != nil {
-		return &transportpb.PublishRequest{
-			Frame: &transportpb.PublishRequest_Audio{
-				Audio: &transportpb.AudioFrame{
-					Pcm:          append([]byte(nil), audio.GetPcm()...),
-					SampleRateHz: audio.GetSampleRateHz(),
-					Channels:     audio.GetChannels(),
-					Codec:        audio.GetCodec(),
-					TimestampMs:  audio.GetTimestampMs(),
-				},
+		logger.Info("[CONNECTOR_TRANSLATE] Returning AudioFrame", "pcmLen", len(audio.GetPcm()))
+		req.Frame = &transportpb.PublishRequest_Audio{
+			Audio: &transportpb.AudioFrame{
+				Pcm:          append([]byte(nil), audio.GetPcm()...),
+				SampleRateHz: audio.GetSampleRateHz(),
+				Channels:     audio.GetChannels(),
+				Codec:        audio.GetCodec(),
+				TimestampMs:  audio.GetTimestampMs(),
 			},
-		}, nil
+		}
+		return req, nil
 	}
 
 	if video := packet.GetVideo(); video != nil {
-		return &transportpb.PublishRequest{
-			Frame: &transportpb.PublishRequest_Video{
-				Video: &transportpb.VideoFrame{
-					Payload:     append([]byte(nil), video.GetPayload()...),
-					Codec:       video.GetCodec(),
-					Width:       video.GetWidth(),
-					Height:      video.GetHeight(),
-					TimestampMs: video.GetTimestampMs(),
-					Raw:         video.GetRaw(),
-				},
+		req.Frame = &transportpb.PublishRequest_Video{
+			Video: &transportpb.VideoFrame{
+				Payload:     append([]byte(nil), video.GetPayload()...),
+				Codec:       video.GetCodec(),
+				Width:       video.GetWidth(),
+				Height:      video.GetHeight(),
+				TimestampMs: video.GetTimestampMs(),
+				Raw:         video.GetRaw(),
 			},
-		}, nil
+		}
+		return req, nil
 	}
 
+	logger.Info("[CONNECTOR_TRANSLATE] No Audio/Video found, creating Envelope from Payload/Inputs")
 	env := &envelope.Envelope{
 		Metadata:   cloneStringMap(packet.Metadata),
 		Payload:    structToRawJSON(packet.Payload),
@@ -807,11 +925,16 @@ func hubPacketToPublishRequest(packet *transportpb.DataPacket) (*transportpb.Pub
 	}
 	extractEnvelopeHeaders(env)
 	if isEnvelopeEmpty(env) {
+		logger.Info("[CONNECTOR_TRANSLATE] Envelope is empty, returning nil")
 		return nil, nil
 	}
+	logger.Info("[CONNECTOR_TRANSLATE] Converting Envelope to BinaryFrame")
 	frame, err := envelope.ToBinaryFrame(env)
 	if err != nil {
 		return nil, err
+	}
+	if env.TimestampMs > 0 {
+		frame.TimestampMs = uint64(env.TimestampMs)
 	}
 	if bin := packet.GetBinary(); bin != nil {
 		frame.TimestampMs = bin.GetTimestampMs()
@@ -819,9 +942,8 @@ func hubPacketToPublishRequest(packet *transportpb.DataPacket) (*transportpb.Pub
 			frame.MimeType = mime
 		}
 	}
-	return &transportpb.PublishRequest{
-		Frame: &transportpb.PublishRequest_Binary{Binary: frame},
-	}, nil
+	req.Frame = &transportpb.PublishRequest_Binary{Binary: frame}
+	return req, nil
 }
 
 func isEnvelopeEmpty(env *envelope.Envelope) bool {
@@ -953,6 +1075,38 @@ func structToNative(st *structpb.Struct) map[string]any {
 		return nil
 	}
 	return st.AsMap()
+}
+
+func cloneStruct(st *structpb.Struct) *structpb.Struct {
+	if st == nil {
+		return nil
+	}
+	clone, ok := proto.Clone(st).(*structpb.Struct)
+	if !ok {
+		return nil
+	}
+	return clone
+}
+
+func cloneTransportDescriptors(src []*transportpb.TransportDescriptor) []*transportpb.TransportDescriptor {
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]*transportpb.TransportDescriptor, 0, len(src))
+	for _, td := range src {
+		if td == nil {
+			continue
+		}
+		clone, ok := proto.Clone(td).(*transportpb.TransportDescriptor)
+		if !ok {
+			continue
+		}
+		out = append(out, clone)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 type mediaGate struct {

@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
 	"github.com/bubustack/bobravoz-grpc/pkg/metrics"
+	"github.com/bubustack/core/contracts"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/go-logr/logr"
 	pbproto "google.golang.org/protobuf/proto"

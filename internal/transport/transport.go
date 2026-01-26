@@ -36,8 +36,9 @@ const (
 type Transport interface {
 	// Reconcile ensures the transport is correctly configured for the given StoryRun.
 	Reconcile(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story) error
-	// EnsureCleanUp performs any necessary cleanup when a StoryRun is deleted.
-	EnsureCleanUp(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story) error
+	// EnsureCleanUp performs any necessary cleanup when a StoryRun is deleted and
+	// returns how many annotations or bindings were updated.
+	EnsureCleanUp(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story) (int, error)
 }
 
 // Builder is a function that creates a new Transport.
@@ -60,6 +61,12 @@ func Get(name string, cli client.Client) (Transport, error) {
 		return nil, fmt.Errorf("no transport builder registered for %q", name)
 	}
 	return builder(cli)
+}
+
+// IsRegistered returns true when a transport builder has been registered for the name.
+func IsRegistered(name string) bool {
+	_, exists := transportBuilders[name]
+	return exists
 }
 
 func init() {

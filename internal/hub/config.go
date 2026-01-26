@@ -21,7 +21,7 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/bubustack/bobrapet/pkg/contracts"
+	"github.com/bubustack/core/contracts"
 )
 
 var (
