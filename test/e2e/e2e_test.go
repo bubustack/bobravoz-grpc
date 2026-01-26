@@ -2,7 +2,7 @@
 // +build e2e
 
 /*
-Copyright 2026.
+Copyright 2025 BubuStack.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "bobravoz-grpc-system"
+const namespace = "bobrapet-system"
 
 // serviceAccountName created for the project
 const serviceAccountName = "bobravoz-grpc-controller-manager"
