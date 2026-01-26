@@ -2,7 +2,7 @@
 // +build e2e
 
 /*
-Copyright 2025 BubuStack.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ var (
 
 	// projectImage is the name of the image which will be build and loaded
 	// with the code source changes to be tested.
-	projectImage = "bobravoz-grpc:latest"
+	projectImage = "example.com/bobravoz-grpc:v0.0.1"
 )
 
 // TestE2E runs the end-to-end (e2e) test suite for the project. These tests execute in an isolated,

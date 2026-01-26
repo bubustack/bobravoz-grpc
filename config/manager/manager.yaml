@@ -61,37 +61,11 @@ spec:
       - command:
         - /manager
         args:
-          # - --leader-elect
+          - --leader-elect
           - --health-probe-bind-address=:8081
-          - --hub-port=9000
-          - --config-namespace=bobrapet-system
-          - --config-name=bobravoz-grpc-operator-config
         image: controller:latest
-        imagePullPolicy: IfNotPresent
         name: manager
-        env:
-        - name: BUBU_HUB_SERVICE_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        - name: BUBU_HUB_SERVICE_NAME
-          value: bobravoz-grpc-bobravoz-grpc-hub
-        - name: CONNECTOR_IMAGE
-          value: bobravoz-grpc-connector:latest
-        - name: CONNECTOR_IMAGE_PULL_POLICY
-          value: IfNotPresent
-        - name: POD_NAME
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.name
-        - name: POD_NAMESPACE
-          valueFrom:
-            fieldRef:
-              fieldPath: metadata.namespace
-        ports:
-        - containerPort: 9000
-          name: grpc
-          protocol: TCP
+        ports: []
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
@@ -119,13 +93,7 @@ spec:
           requests:
             cpu: 10m
             memory: 64Mi
-        volumeMounts:
-        - name: bobravoz-grpc-hub-tls
-          mountPath: /var/run/hub-tls
-          readOnly: true
-      volumes:
-      - name: bobravoz-grpc-hub-tls
-        secret:
-          secretName: bobravoz-grpc-hub-tls
+        volumeMounts: []
+      volumes: []
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10
