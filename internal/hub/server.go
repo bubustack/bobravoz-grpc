@@ -143,10 +143,27 @@ func (e *errStopPropagation) Error() string {
 }
 
 // concurrencyMode returns the streaming concurrency mode for the given story.
-// TODO(task-9): read from story.Spec.Transport.ConcurrencyMode once the CRD
-// field is added. Until then, default to "parallel" (no behaviour change).
-func (s *Server) concurrencyMode(_ *bubuv1alpha1.Story) string {
+func (s *Server) concurrencyMode(story *bubuv1alpha1.Story) string {
+	if story.Spec.Concurrency != nil && story.Spec.Concurrency.Mode != "" {
+		return string(story.Spec.Concurrency.Mode)
+	}
 	return "parallel"
+}
+
+// extractParticipant returns a participant identifier from the packet metadata.
+// It checks "participant" first, then falls back to "participant.id".
+func extractParticipant(pkt *transportpb.DataPacket) string {
+	if pkt == nil {
+		return ""
+	}
+	md := pkt.Metadata
+	if md == nil {
+		return ""
+	}
+	if id := md["participant"]; id != "" {
+		return id
+	}
+	return md["participant.id"]
 }
 
 // NewServer creates a new hub server.
@@ -900,6 +917,11 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 	// Pipeline cycle management: track active processing cycles per step so that
 	// concurrency modes (cancelPrevious, serial) can cancel or gate new packets.
 	cycleKey := storyRunNS + "/" + storyRunName + ":" + currentStepID
+	if story.Spec.Concurrency != nil && story.Spec.Concurrency.Scope == bubuv1alpha1.ConcurrencyScopeParticipant {
+		if participant := extractParticipant(in); participant != "" {
+			cycleKey += ":" + participant
+		}
+	}
 	mode := s.concurrencyMode(story)
 	cycle := s.cycles.start(cycleKey, mode, ctx)
 	defer func() {
