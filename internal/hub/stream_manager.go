@@ -1450,6 +1450,7 @@ func (sm *StreamManager) evictOldBuffers(ttl time.Duration) {
 		isExpired := lastActiveDuration > ttl
 
 		if isExpired {
+			buffer.DropAll("evicted")
 			sm.deleteBuffer(keyStr)
 			sm.log.Info("Evicted old buffer", "key", key, "age", lastActiveDuration)
 		}
