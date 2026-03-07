@@ -561,6 +561,7 @@ func (s *Server) emitLifecycleHookEvent(
 	eventName string,
 	originStepID string,
 ) bool {
+	ctx = withTransportSettingsCache(ctx)
 	consumerIdx := lifecycleHookConsumerStepIndexes(story, eventName)
 	if len(consumerIdx) == 0 {
 		return false
@@ -900,6 +901,9 @@ func (s *Server) messageLoop(ctx context.Context, stream transportpb.HubService_
 
 // processPacket executes the routing logic for a received packet.
 func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, currentStepID string, in *transportpb.DataPacket) error {
+	// Attach a per-packet transport settings cache so that all resolve*ForStep
+	// calls within this dispatch share cached K8s lookups/JSON unmarshals.
+	ctx = withTransportSettingsCache(ctx)
 	storyRun, story, err := s.getStoryAndRunWithRetry(ctx, storyRunName, storyRunNS)
 	if err != nil {
 		s.log.Error(err, "Failed to get story and run after retries", "storyRun", storyRunName)
