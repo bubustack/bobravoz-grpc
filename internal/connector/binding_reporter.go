@@ -41,6 +41,7 @@ type bindingStatusReporter struct {
 	listeners   map[chan capabilityState]struct{}
 	listenersMu sync.Mutex
 
+	heartbeatHook func()
 	heartbeatMu   sync.Mutex
 	lastHeartbeat time.Time
 }
@@ -333,8 +334,13 @@ func (r *bindingStatusReporter) WatchCapabilities(ctx context.Context) <-chan ca
 	}
 	r.listeners[ch] = struct{}{}
 	active := len(r.listeners)
-	current := r.state.clone()
 	r.listenersMu.Unlock()
+
+	// Acquire stateMu separately to clone current state — correct lock order that
+	// matches applyObservation (which holds stateMu when writing r.state).
+	r.stateMu.RLock()
+	current := r.state.clone()
+	r.stateMu.RUnlock()
 
 	r.updateListenerGauge(active)
 	r.log.V(1).Info("registered capability listener", "binding", r.key.String(), "activeListeners", active)
@@ -437,6 +443,9 @@ func (r *bindingStatusReporter) RecordHeartbeat(ctx context.Context, metadata ma
 	if r == nil {
 		return
 	}
+	if r.heartbeatHook != nil {
+		r.heartbeatHook()
+	}
 
 	r.heartbeatMu.Lock()
 	defer r.heartbeatMu.Unlock()
@@ -454,11 +463,16 @@ func (r *bindingStatusReporter) RecordHeartbeat(ctx context.Context, metadata ma
 
 	cm := conditions.NewConditionManager(binding.Generation)
 	if cond := conditions.GetCondition(binding.Status.Conditions, conditions.ConditionReady); cond != nil {
-		cond.Status = metav1.ConditionTrue
-		cond.Reason = conditions.ReasonTransportReady
-		cond.Message = message
-		cond.LastTransitionTime = metav1.Now()
-		cond.ObservedGeneration = binding.Generation
+		if cond.Reason == conditions.ReasonInvalidConfiguration {
+			cond.LastTransitionTime = metav1.Now()
+			cond.ObservedGeneration = binding.Generation
+		} else {
+			cond.Status = metav1.ConditionTrue
+			cond.Reason = conditions.ReasonTransportReady
+			cond.Message = message
+			cond.LastTransitionTime = metav1.Now()
+			cond.ObservedGeneration = binding.Generation
+		}
 	} else {
 		cm.SetReadyCondition(&binding.Status.Conditions, true, conditions.ReasonTransportReady, message)
 	}

@@ -21,6 +21,43 @@ const (
 	testBindingNamespace = "default"
 )
 
+// TestWatchCapabilities_NoRaceWithApplyObservation verifies that concurrent
+// WatchCapabilities and applyObservation calls do not race on r.state.
+// Run with -race to catch the previously missing stateMu lock.
+func TestWatchCapabilities_NoRaceWithApplyObservation(t *testing.T) {
+	r := &bindingStatusReporter{
+		log:       logr.Discard(),
+		listeners: make(map[chan capabilityState]struct{}),
+		updates:   make(chan capabilityObservation, 32),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	const iters = 200
+	done := make(chan struct{})
+	// Writer: repeatedly set r.state via stateMu.
+	go func() {
+		defer close(done)
+		for i := 0; i < iters; i++ {
+			r.stateMu.Lock()
+			r.state = capabilityState{}
+			r.stateMu.Unlock()
+		}
+	}()
+
+	// Reader: repeatedly call WatchCapabilities (clones r.state).
+	for i := 0; i < iters; i++ {
+		ch := r.WatchCapabilities(ctx)
+		// drain the channel to avoid blocking the sender goroutine
+		select {
+		case <-ch:
+		default:
+		}
+	}
+	<-done
+}
+
 func TestBindingStatusReporter_ReportReady(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, clientgoscheme.AddToScheme(scheme))
