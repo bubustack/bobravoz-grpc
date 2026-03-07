@@ -834,6 +834,13 @@ func getTransportDefaultSettings(ctx context.Context, reader client.Reader, ref 
 	var transport transportv1alpha1.Transport
 	if err := reader.Get(getCtx, types.NamespacedName{Name: ref}, &transport); err != nil {
 		log.Log.WithName("backpressure").Error(err, "Failed to resolve transport defaults", "transportRef", ref, "transport", transportName)
+		// Evict stale cache entry on any error (e.g. Transport CR deleted).
+		// Without eviction, a deleted Transport would serve stale defaults
+		// until the TTL expires. With eviction, the next packet will attempt
+		// a fresh lookup and fall back to defaults on repeated failure.
+		transportDefaultsCache.mu.Lock()
+		delete(transportDefaultsCache.entries, ref)
+		transportDefaultsCache.mu.Unlock()
 		return nil
 	}
 	settings, err := transportutil.MergeSettingsWithStreaming(transport.Spec.DefaultSettings, transport.Spec.Streaming)
