@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
 	"github.com/bubustack/bobravoz-grpc/pkg/metrics"
+	coretransport "github.com/bubustack/core/runtime/transport"
 	transportconnector "github.com/bubustack/core/runtime/transport/connector"
 	"github.com/bubustack/tractatus/envelope"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
@@ -21,6 +24,7 @@ import (
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
@@ -36,7 +40,17 @@ const (
 	metadataEnvelopeKindKey      = "bubu.envelope.kind"
 	metadataEnvelopeMessageIDKey = "bubu.envelope.message_id"
 	metadataEnvelopeTimeKey      = "bubu.envelope.timestamp_ms"
+
+	handoffDirectiveDraining = "handoff.draining"
+	handoffDirectiveCutover  = "handoff.cutover"
+	handoffDirectiveReady    = "handoff.ready"
 )
+
+type handoffState struct {
+	phase     string
+	reason    string
+	updatedAt time.Time
+}
 
 type runtimeTunables = transportconnector.RuntimeTunables
 
@@ -91,7 +105,9 @@ func (r *Runner) Run(ctx context.Context) error {
 	server := grpc.NewServer(opts...)
 
 	// Register TransportConnectorServer for local engram connections
-	transportpb.RegisterTransportConnectorServer(server, newTransportServer(ctx, r.cfg, r.log, bridge, tunables))
+	transportServer := newTransportServer(ctx, r.cfg, r.log, bridge, tunables)
+	transportpb.RegisterTransportConnectorServer(server, transportServer)
+	bridge.notifyHandoff("cutover", "hub_connected")
 
 	// Register HubService for P2P connections from upstream connectors
 	// This allows this connector to act as a "mini-hub" for P2P routing
@@ -117,25 +133,72 @@ func (r *Runner) Run(ctx context.Context) error {
 
 type transportServer struct {
 	transportpb.UnimplementedTransportConnectorServer
-	ctx        context.Context
-	cfg        *Config
-	log        logr.Logger
-	bridge     *hubBridge
-	reporter   *bindingStatusReporter
-	reportOnce sync.Once
-	gate       *mediaGate
-	tunables   runtimeTunables
+	ctx            context.Context
+	cfg            *Config
+	log            logr.Logger
+	bridge         *hubBridge
+	reporter       *bindingStatusReporter
+	reportOnce     sync.Once
+	gate           *mediaGate
+	tunables       runtimeTunables
+	handoffMu      sync.Mutex
+	handoffState   handoffState
+	handoffUpdates chan *transportpb.ControlDirective
+	watchersMu     sync.Mutex
+	watchers       map[*hangWatcher]struct{}
 }
 
 func newTransportServer(ctx context.Context, cfg *Config, log logr.Logger, bridge *hubBridge, tunables runtimeTunables) *transportServer {
-	return &transportServer{
-		ctx:      ctx,
-		cfg:      cfg,
-		log:      log,
-		bridge:   bridge,
-		reporter: newBindingStatusReporter(cfg, log),
-		gate:     newMediaGate(),
-		tunables: tunables,
+	server := &transportServer{
+		ctx:            ctx,
+		cfg:            cfg,
+		log:            log,
+		bridge:         bridge,
+		reporter:       newBindingStatusReporter(cfg, log),
+		gate:           newMediaGate(),
+		tunables:       tunables,
+		handoffUpdates: make(chan *transportpb.ControlDirective, 8),
+		watchers:       make(map[*hangWatcher]struct{}),
+	}
+	if server.reporter != nil {
+		server.reporter.heartbeatHook = server.touchWatchers
+	}
+	if bridge != nil {
+		bridge.onFlow = server.applyFlowControl
+		bridge.onHandoff = server.signalHandoff
+	}
+	return server
+}
+
+func (s *transportServer) registerWatcher(w *hangWatcher) func() {
+	if s == nil || w == nil {
+		return func() {}
+	}
+	s.watchersMu.Lock()
+	s.watchers[w] = struct{}{}
+	s.watchersMu.Unlock()
+	return func() {
+		s.watchersMu.Lock()
+		delete(s.watchers, w)
+		s.watchersMu.Unlock()
+	}
+}
+
+func (s *transportServer) touchWatchers() {
+	if s == nil {
+		return
+	}
+	s.watchersMu.Lock()
+	watchers := make([]*hangWatcher, 0, len(s.watchers))
+	for w := range s.watchers {
+		watchers = append(watchers, w)
+	}
+	s.watchersMu.Unlock()
+	for _, w := range watchers {
+		w.Touch()
+	}
+	if s.bridge != nil {
+		s.bridge.touch()
 	}
 }
 
@@ -162,6 +225,74 @@ func (s *transportServer) recordControlDirective(direction, directiveType string
 	metrics.RecordConnectorControlDirective(ns, binding, direction, normalizeDirectiveType(directiveType))
 }
 
+func (s *transportServer) signalHandoff(phase, reason string) {
+	if s == nil || strings.TrimSpace(phase) == "" {
+		return
+	}
+	state := handoffState{
+		phase:     strings.ToLower(strings.TrimSpace(phase)),
+		reason:    strings.TrimSpace(reason),
+		updatedAt: time.Now(),
+	}
+	s.handoffMu.Lock()
+	s.handoffState = state
+	s.handoffMu.Unlock()
+	s.enqueueHandoff(state)
+}
+
+func (s *transportServer) enqueueHandoff(state handoffState) {
+	if s == nil {
+		return
+	}
+	directive := handoffDirective(state)
+	if directive == nil {
+		return
+	}
+	select {
+	case s.handoffUpdates <- directive:
+	default:
+		s.log.V(1).Info("Dropping handoff directive; channel full", "phase", state.phase)
+	}
+}
+
+func (s *transportServer) emitHandoffSnapshot() {
+	if s == nil {
+		return
+	}
+	s.handoffMu.Lock()
+	state := s.handoffState
+	s.handoffMu.Unlock()
+	if state.phase == "" {
+		return
+	}
+	s.enqueueHandoff(state)
+}
+
+func handoffDirective(state handoffState) *transportpb.ControlDirective {
+	phase := strings.ToLower(strings.TrimSpace(state.phase))
+	var typ string
+	switch phase {
+	case "draining":
+		typ = handoffDirectiveDraining
+	case "cutover":
+		typ = handoffDirectiveCutover
+	case "ready":
+		typ = handoffDirectiveReady
+	default:
+		return nil
+	}
+	md := map[string]string{
+		"phase": phase,
+	}
+	if state.reason != "" {
+		md["reason"] = state.reason
+	}
+	if !state.updatedAt.IsZero() {
+		md["ts"] = strconv.FormatInt(state.updatedAt.UnixMilli(), 10)
+	}
+	return &transportpb.ControlDirective{Type: typ, Metadata: md}
+}
+
 func (s *transportServer) reportReady(_ context.Context) {
 	if s.reporter == nil {
 		return
@@ -180,9 +311,16 @@ func (s *transportServer) Publish(stream transportpb.TransportConnector_PublishS
 		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("publish-hang"))
 		defer watcher.Stop()
 	}
+	unregisterWatcher := s.registerWatcher(watcher)
+	defer unregisterWatcher()
 	s.reportReady(ctx)
 	for {
-		req, err := transportconnector.RecvWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "publish recv", stream.Recv)
+		// Do NOT use RecvWithTimeout here — the Publish stream is inherently
+		// bursty; engrams only publish when they have data.  A hard 30 s
+		// timeout kills idle streams and cascades to all other goroutines
+		// via the shared errgroup context.  Connection liveness is handled
+		// by gRPC keepalive and the optional hang watcher instead.
+		req, err := stream.Recv()
 		if err != nil {
 			if status.Code(err) == status.Code(context.Canceled) || err == context.Canceled {
 				return err
@@ -209,6 +347,16 @@ func (s *transportServer) Publish(stream transportpb.TransportConnector_PublishS
 			"audioPcmLen", audioPcmLen,
 			"hasVideo", hasVideo,
 			"hasBinary", hasBinary)
+
+		// Detect SDK publish heartbeats: no frame, just metadata.
+		// Touch the hang watcher to keep the stream alive but do not
+		// forward the heartbeat to the hub — it carries no real data.
+		if isPublishHeartbeat(req) {
+			if watcher != nil {
+				watcher.Touch()
+			}
+			continue
+		}
 
 		s.recordCapabilitiesFromRequest(req)
 		packet, err := publishRequestToHubPacket(req)
@@ -257,6 +405,8 @@ func (s *transportServer) Subscribe(_ *transportpb.SubscribeRequest, stream tran
 		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("subscribe-hang"))
 		defer watcher.Stop()
 	}
+	unregisterWatcher := s.registerWatcher(watcher)
+	defer unregisterWatcher()
 	s.reportReady(ctx)
 	s.log.Info("Subscribe: waiting for packets from hub bridge")
 	for {
@@ -296,6 +446,7 @@ func (s *transportServer) Subscribe(_ *transportpb.SubscribeRequest, stream tran
 				s.log.Error(err, "Subscribe: failed to send to engram")
 				return err
 			}
+			s.bridge.RecordDelivery(packet)
 			s.log.Info("Subscribe: packet sent to engram successfully")
 			if watcher != nil {
 				watcher.Touch()
@@ -312,11 +463,21 @@ func (s *transportServer) Subscribe(_ *transportpb.SubscribeRequest, stream tran
 func (s *transportServer) Control(stream transportpb.TransportConnector_ControlServer) error {
 	ctx, cancel := context.WithCancel(stream.Context())
 	defer cancel()
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return status.Error(codes.FailedPrecondition, "control stream missing metadata")
+	}
+	if err := coretransport.ValidateProtocolVersion(metadataValue(md, coretransport.ProtocolMetadataKey)); err != nil {
+		s.log.Error(err, "Control stream rejected due to protocol version")
+		return status.Error(codes.FailedPrecondition, err.Error())
+	}
 	var watcher *hangWatcher
 	if s.tunables.HangTimeout > 0 {
 		watcher = newHangWatcher(s.tunables.HangTimeout, cancel, s.log.WithName("control-hang"))
 		defer watcher.Stop()
 	}
+	unregisterWatcher := s.registerWatcher(watcher)
+	defer unregisterWatcher()
 	s.reportReady(ctx)
 	if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control ready send", func() error {
 		return stream.Send(connectorReadyDirective())
@@ -330,8 +491,12 @@ func (s *transportServer) Control(stream transportpb.TransportConnector_ControlS
 		return s.forwardCapabilityUpdates(groupCtx, cancel, stream, updates, watcher)
 	})
 	group.Go(func() error {
+		return s.forwardHandoffUpdates(groupCtx, cancel, stream, watcher)
+	})
+	group.Go(func() error {
 		return s.consumeControlDirectives(groupCtx, cancel, stream, watcher)
 	})
+	s.emitHandoffSnapshot()
 
 	if err := group.Wait(); err != nil && err != context.Canceled {
 		return err
@@ -361,6 +526,35 @@ func (s *transportServer) forwardCapabilityUpdates(ctx context.Context, cancel c
 	}
 }
 
+func (s *transportServer) forwardHandoffUpdates(ctx context.Context, cancel context.CancelFunc, stream transportpb.TransportConnector_ControlServer, watcher *hangWatcher) error {
+	if s == nil {
+		return nil
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case directive, ok := <-s.handoffUpdates:
+			if !ok {
+				return nil
+			}
+			if directive == nil {
+				continue
+			}
+			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control handoff send", func() error {
+				return stream.Send(directive)
+			}); err != nil {
+				return err
+			}
+			s.recordControlDirective("sent", directive.GetType())
+			s.log.V(1).Info("Control: forwarded handoff directive", "type", directive.GetType())
+			if watcher != nil {
+				watcher.Touch()
+			}
+		}
+	}
+}
+
 func (s *transportServer) consumeControlDirectives(ctx context.Context, cancel context.CancelFunc, stream transportpb.TransportConnector_ControlServer, watcher *hangWatcher) error {
 	for {
 		select {
@@ -369,9 +563,13 @@ func (s *transportServer) consumeControlDirectives(ctx context.Context, cancel c
 		default:
 		}
 
-		directive, err := transportconnector.RecvWithTimeout(ctx, s.tunables.MessageTimeout, cancel, "control recv", stream.Recv)
+		// Do NOT use RecvWithTimeout here — the Control stream is often idle
+		// when no directives are sent. A hard 30 s timeout kills the stream
+		// and cascades cancellations. Connection liveness is handled by gRPC
+		// keepalive and the optional hang watcher (touched on heartbeats).
+		directive, err := stream.Recv()
 		if err != nil {
-			if err == io.EOF || errors.Is(err, context.Canceled) {
+			if err == io.EOF || errors.Is(err, context.Canceled) || status.Code(err) == status.Code(context.Canceled) {
 				return nil
 			}
 			return err
@@ -449,6 +647,17 @@ func normalizeDirectiveType(val string) string {
 	return typ
 }
 
+func metadataValue(md metadata.MD, key string) string {
+	if len(md) == 0 || strings.TrimSpace(key) == "" {
+		return ""
+	}
+	values := md.Get(key)
+	if len(values) == 0 {
+		return ""
+	}
+	return values[0]
+}
+
 func (s *transportServer) handleControlDirective(ctx context.Context, directive *transportpb.ControlDirective) *transportpb.ControlDirective {
 	if directive == nil {
 		return nil
@@ -487,6 +696,20 @@ func (s *transportServer) handleControlDirective(ctx context.Context, directive 
 		return ackDirective(typ, false, map[string]string{"reason": "codec selection not implemented"})
 	default:
 		return ackDirective(typ, false, map[string]string{"reason": "unknown"})
+	}
+}
+
+func (s *transportServer) applyFlowControl(flow *transportpb.FlowControl) {
+	if s == nil || flow == nil {
+		return
+	}
+	if flow.GetPause() {
+		s.gate.EnableUpstream(false)
+		s.log.V(1).Info("Flow control: upstream paused")
+	}
+	if flow.GetResume() {
+		s.gate.EnableUpstream(true)
+		s.log.V(1).Info("Flow control: upstream resumed")
 	}
 }
 
@@ -534,87 +757,381 @@ func describeFrame(req *transportpb.PublishRequest) string {
 	}
 }
 
+type flowControlMode string
+
+const (
+	flowControlNone    flowControlMode = "none"
+	flowControlCredits flowControlMode = "credits"
+	flowControlWindow  flowControlMode = "window"
+)
+
+type orderingMode string
+
+const (
+	orderingNone         orderingMode = "none"
+	orderingPerStream    orderingMode = "per_stream"
+	orderingPerPartition orderingMode = "per_partition"
+)
+
+type flowAckSettings struct {
+	Messages *int    `json:"messages,omitempty"`
+	Bytes    *int    `json:"bytes,omitempty"`
+	MaxDelay *string `json:"maxDelay,omitempty"`
+}
+
+type flowControlConfig struct {
+	Mode     string           `json:"mode,omitempty"`
+	AckEvery *flowAckSettings `json:"ackEvery,omitempty"`
+}
+
+type deliveryConfig struct {
+	Ordering  string `json:"ordering,omitempty"`
+	Semantics string `json:"semantics,omitempty"`
+}
+
+type transportSettings struct {
+	FlowControl *flowControlConfig `json:"flowControl,omitempty"`
+	Delivery    *deliveryConfig    `json:"delivery,omitempty"`
+}
+
+type flowTracker struct {
+	mu                 sync.Mutex
+	mode               flowControlMode
+	ordering           orderingMode
+	ackEveryMessages   int
+	ackEveryBytes      int
+	ackEveryDelay      time.Duration
+	pendingMessages    int
+	pendingBytes       int
+	lastSeq            uint64
+	lastSeqByPartition map[string]uint64
+	pendingAcks        map[string]uint64
+	lastSend           time.Time
+	log                logr.Logger
+}
+
+func newFlowTracker(log logr.Logger, payload []byte) *flowTracker {
+	tracker := &flowTracker{
+		mode:             flowControlNone,
+		ordering:         orderingNone,
+		ackEveryMessages: 1,
+		log:              log,
+	}
+	if len(payload) == 0 {
+		return tracker
+	}
+	var settings transportSettings
+	if err := json.Unmarshal(payload, &settings); err != nil {
+		log.V(1).Info("Failed to parse transport settings payload for flow control", "error", err)
+		return tracker
+	}
+	if settings.FlowControl == nil {
+	} else {
+		switch strings.ToLower(strings.TrimSpace(settings.FlowControl.Mode)) {
+		case string(flowControlCredits):
+			tracker.mode = flowControlCredits
+		case string(flowControlWindow):
+			tracker.mode = flowControlWindow
+		case "", string(flowControlNone):
+			tracker.mode = flowControlNone
+		default:
+			log.V(1).Info("Unknown flow control mode; defaulting to none", "mode", settings.FlowControl.Mode)
+			tracker.mode = flowControlNone
+		}
+		if settings.FlowControl.AckEvery != nil {
+			if settings.FlowControl.AckEvery.Messages != nil {
+				if *settings.FlowControl.AckEvery.Messages > 0 {
+					tracker.ackEveryMessages = *settings.FlowControl.AckEvery.Messages
+				} else {
+					log.V(1).Info("Invalid ackEvery.messages; defaulting to 1", "value", *settings.FlowControl.AckEvery.Messages)
+				}
+			}
+			if settings.FlowControl.AckEvery.Bytes != nil && *settings.FlowControl.AckEvery.Bytes > 0 {
+				tracker.ackEveryBytes = *settings.FlowControl.AckEvery.Bytes
+			}
+			if settings.FlowControl.AckEvery.MaxDelay != nil && strings.TrimSpace(*settings.FlowControl.AckEvery.MaxDelay) != "" {
+				if d, err := time.ParseDuration(strings.TrimSpace(*settings.FlowControl.AckEvery.MaxDelay)); err == nil && d > 0 {
+					tracker.ackEveryDelay = d
+				} else {
+					log.V(1).Info("Invalid ackEvery.maxDelay; ignoring", "value", *settings.FlowControl.AckEvery.MaxDelay)
+				}
+			}
+		}
+	}
+	if settings.Delivery != nil {
+		ordering := strings.ToLower(strings.TrimSpace(settings.Delivery.Ordering))
+		switch ordering {
+		case string(orderingPerStream):
+			tracker.ordering = orderingPerStream
+		case string(orderingPerPartition):
+			tracker.ordering = orderingPerPartition
+		case string(orderingNone), "":
+			tracker.ordering = orderingNone
+		default:
+			log.V(1).Info("Unknown ordering mode; defaulting to none", "ordering", settings.Delivery.Ordering)
+			tracker.ordering = orderingNone
+		}
+		semantics := strings.ToLower(strings.TrimSpace(settings.Delivery.Semantics))
+		if semantics == "at_least_once" && tracker.ordering == orderingNone {
+			tracker.ordering = orderingPerStream
+		}
+	}
+	return tracker
+}
+
+func (t *flowTracker) reset() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	t.pendingMessages = 0
+	t.pendingBytes = 0
+	t.lastSeq = 0
+	t.lastSeqByPartition = nil
+	t.pendingAcks = nil
+	t.lastSend = time.Time{}
+	t.mu.Unlock()
+}
+
+func (t *flowTracker) recordDelivery(packet *transportpb.DataPacket) *transportpb.FlowControl {
+	if t == nil || packet == nil {
+		return nil
+	}
+	size := proto.Size(packet)
+	seq := packet.GetEnvelope().GetSequence()
+	partition := packet.GetEnvelope().GetPartition()
+	now := time.Now()
+
+	t.mu.Lock()
+	t.pendingMessages++
+	t.pendingBytes += size
+	if t.ordering == orderingPerPartition {
+		if seq > 0 {
+			if t.lastSeqByPartition == nil {
+				t.lastSeqByPartition = make(map[string]uint64)
+			}
+			if seq > t.lastSeqByPartition[partition] {
+				t.lastSeqByPartition[partition] = seq
+			}
+			if t.pendingAcks == nil {
+				t.pendingAcks = make(map[string]uint64)
+			}
+			if seq > t.pendingAcks[partition] {
+				t.pendingAcks[partition] = seq
+			}
+		}
+	} else if seq > 0 && seq > t.lastSeq {
+		t.lastSeq = seq
+	}
+
+	shouldSend := false
+	if t.ackEveryMessages > 0 && t.pendingMessages >= t.ackEveryMessages {
+		shouldSend = true
+	}
+	if t.ackEveryBytes > 0 && t.pendingBytes >= t.ackEveryBytes {
+		shouldSend = true
+	}
+	if t.ackEveryDelay > 0 && (t.lastSend.IsZero() || now.Sub(t.lastSend) >= t.ackEveryDelay) {
+		shouldSend = true
+	}
+	if !shouldSend {
+		t.mu.Unlock()
+		return nil
+	}
+
+	flow := &transportpb.FlowControl{}
+	if t.ordering == orderingPerPartition {
+		if len(t.pendingAcks) > 0 {
+			partitions := make([]string, 0, len(t.pendingAcks))
+			for partitionKey := range t.pendingAcks {
+				partitions = append(partitions, partitionKey)
+			}
+			sort.Strings(partitions)
+			flow.PartitionAcks = make([]*transportpb.PartitionAck, 0, len(partitions))
+			for _, partitionKey := range partitions {
+				ack := t.pendingAcks[partitionKey]
+				if ack == 0 {
+					continue
+				}
+				flow.PartitionAcks = append(flow.PartitionAcks, &transportpb.PartitionAck{Partition: partitionKey, Ack: ack})
+			}
+		}
+	} else if t.lastSeq > 0 {
+		flow.Ack = t.lastSeq
+	}
+	if t.mode == flowControlCredits {
+		flow.CreditsMessages = clampUint32(t.pendingMessages)
+		flow.CreditsBytes = clampUint32(t.pendingBytes)
+	}
+	t.pendingMessages = 0
+	t.pendingBytes = 0
+	if t.ordering == orderingPerPartition {
+		t.pendingAcks = nil
+	}
+	t.lastSend = now
+	t.mu.Unlock()
+
+	if flow.Ack == 0 && len(flow.PartitionAcks) == 0 && flow.CreditsMessages == 0 && flow.CreditsBytes == 0 {
+		return nil
+	}
+	return flow
+}
+
+func clampUint32(v int) uint32 {
+	if v <= 0 {
+		return 0
+	}
+	if v > int(^uint32(0)) {
+		return ^uint32(0)
+	}
+	return uint32(v)
+}
+
 type hubBridge struct {
 	cfg *Config
 	log logr.Logger
 
-	conn   *grpc.ClientConn
-	client transportpb.HubService_ProcessClient
+	clientMu     sync.RWMutex
+	conn         *grpc.ClientConn
+	client       transportpb.HubService_ProcessClient
+	streamCancel context.CancelFunc
 
-	sendMu sync.Mutex
-	recvCh chan *transportpb.DataPacket
-	ctx    context.Context
-	cancel context.CancelFunc
+	sendMu    sync.Mutex
+	recvCh    chan *transportpb.DataPacket
+	closeOnce sync.Once
+	closed    atomic.Bool
+
+	outboxMu        sync.Mutex
+	outbox          []*transportpb.DataPacket
+	outboxMax       int
+	flushInProgress atomic.Bool
+
+	reconnectMu  sync.Mutex
+	reconnecting bool
+	ctx          context.Context
+	cancel       context.CancelFunc
 
 	messageTimeout     time.Duration
 	channelSendTimeout time.Duration
 	watcher            *hangWatcher
+	flow               *flowTracker
+	onFlow             func(*transportpb.FlowControl)
+	onHandoff          func(phase, reason string)
 }
 
 func newHubBridge(ctx context.Context, cfg *Config, log logr.Logger, tunables runtimeTunables) (*hubBridge, error) {
-	log.Info("Connecting to hub", "endpoint", cfg.HubEndpoint, "step", cfg.StepID, "storyRun", cfg.StoryRunName)
-	conn, err := dialHub(ctx, cfg)
+	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
+	hb := &hubBridge{
+		cfg:                cfg,
+		log:                log,
+		recvCh:             make(chan *transportpb.DataPacket, tunables.ChannelBufferSize),
+		ctx:                bridgeCtx,
+		cancel:             bridgeCancel,
+		messageTimeout:     tunables.MessageTimeout,
+		channelSendTimeout: tunables.ChannelSendTimeout,
+	}
+	hb.outboxMax = outboxMaxFromTunables(tunables)
+	var settingsPayload []byte
+	if cfg != nil && cfg.Binding.Info != nil {
+		settingsPayload = cfg.Binding.Info.GetPayload()
+	}
+	hb.flow = newFlowTracker(log.WithName("flow-control"), settingsPayload)
+	if tunables.HangTimeout > 0 {
+		hb.watcher = newHangWatcher(tunables.HangTimeout, hb.forceReconnect, log.WithName("hub-bridge"))
+	}
+	conn, client, streamCancel, err := hb.openHubStream(ctx)
 	if err != nil {
-		log.Error(err, "Failed to dial hub", "endpoint", cfg.HubEndpoint)
+		bridgeCancel()
 		return nil, err
 	}
+	hb.setConnection(conn, client, streamCancel)
+	hb.startReadLoop(client)
+	log.Info("Hub bridge read loop started", "step", cfg.StepID, "outboxMax", hb.outboxMax)
+	return hb, nil
+}
+
+func outboxMaxFromTunables(tunables runtimeTunables) int {
+	max := tunables.ChannelBufferSize
+	if max < 64 {
+		max = 64
+	}
+	if max > 2048 {
+		max = 2048
+	}
+	return max
+}
+
+func (b *hubBridge) openHubStream(ctx context.Context) (*grpc.ClientConn, transportpb.HubService_ProcessClient, context.CancelFunc, error) {
+	if b == nil || b.cfg == nil {
+		return nil, nil, nil, fmt.Errorf("hub bridge config missing")
+	}
+	b.log.Info("Connecting to hub", "endpoint", b.cfg.HubEndpoint, "step", b.cfg.StepID, "storyRun", b.cfg.StoryRunName)
+	conn, err := dialHub(ctx, b.cfg)
+	if err != nil {
+		b.log.Error(err, "Failed to dial hub", "endpoint", b.cfg.HubEndpoint)
+		return nil, nil, nil, err
+	}
 	md := metadata.Pairs(
-		metaStoryRunName, cfg.StoryRunName,
-		metaStoryRunNS, cfg.Namespace,
-		metaCurrentStepID, cfg.StepID,
+		metaStoryRunName, b.cfg.StoryRunName,
+		metaStoryRunNS, b.cfg.Namespace,
+		metaCurrentStepID, b.cfg.StepID,
+		coretransport.ProtocolMetadataKey, coretransport.ProtocolVersion,
 	)
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	processCtx := metadata.NewOutgoingContext(streamCtx, md)
 	client, err := transportpb.NewHubServiceClient(conn).Process(processCtx)
 	if err != nil {
-		log.Error(err, "Failed to create hub stream", "endpoint", cfg.HubEndpoint)
+		b.log.Error(err, "Failed to create hub stream", "endpoint", b.cfg.HubEndpoint)
 		streamCancel()
 		_ = conn.Close()
-		return nil, fmt.Errorf("connecting to hub: %w", err)
+		return nil, nil, nil, fmt.Errorf("connecting to hub: %w", err)
 	}
-
-	log.Info("Successfully connected to hub and registered stream", "step", cfg.StepID, "storyRun", cfg.StoryRunName)
-
-	bridgeCtx, bridgeCancel := context.WithCancel(ctx)
-	cancelAll := func() {
-		streamCancel()
-		bridgeCancel()
-	}
-	hb := &hubBridge{
-		cfg:                cfg,
-		log:                log,
-		conn:               conn,
-		client:             client,
-		recvCh:             make(chan *transportpb.DataPacket, tunables.ChannelBufferSize),
-		ctx:                bridgeCtx,
-		cancel:             cancelAll,
-		messageTimeout:     tunables.MessageTimeout,
-		channelSendTimeout: tunables.ChannelSendTimeout,
-	}
-	if tunables.HangTimeout > 0 {
-		hb.watcher = newHangWatcher(tunables.HangTimeout, cancelAll, log.WithName("hub-bridge"))
-	}
-	go hb.readLoop()
-	log.Info("Hub bridge read loop started", "step", cfg.StepID)
-	return hb, nil
+	b.log.Info("Successfully connected to hub and registered stream", "step", b.cfg.StepID, "storyRun", b.cfg.StoryRunName)
+	return conn, client, streamCancel, nil
 }
 
-func (b *hubBridge) readLoop() {
-	defer close(b.recvCh)
+func (b *hubBridge) setConnection(conn *grpc.ClientConn, client transportpb.HubService_ProcessClient, streamCancel context.CancelFunc) {
+	b.clientMu.Lock()
+	b.conn = conn
+	b.client = client
+	b.streamCancel = streamCancel
+	b.clientMu.Unlock()
+}
+
+func (b *hubBridge) getClient() transportpb.HubService_ProcessClient {
+	b.clientMu.RLock()
+	client := b.client
+	b.clientMu.RUnlock()
+	return client
+}
+
+func (b *hubBridge) startReadLoop(client transportpb.HubService_ProcessClient) {
+	if client == nil {
+		return
+	}
+	go b.readLoop(client)
+}
+
+func (b *hubBridge) readLoop(client transportpb.HubService_ProcessClient) {
 	b.log.Info("Hub bridge readLoop started, waiting for packets from hub")
 	for {
-		response, err := transportconnector.RecvWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub recv", b.client.Recv)
+		// Do NOT use RecvWithTimeout here — downstream steps (synthesize,
+		// playback, transcribe) may not receive hub packets for extended
+		// periods when the pipeline is idle or waiting for upstream events.
+		// A 30 s hard timeout tears down the hub bridge and cascades to
+		// all local streams.  Connection liveness is handled by gRPC
+		// keepalive and the optional hang watcher.
+		response, err := client.Recv()
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
-				b.log.Info("Hub bridge readLoop exiting", "reason", err.Error())
-				return
-			}
-			b.log.Error(err, "hub stream recv failed")
+			b.handleDisconnect(client, err)
 			return
 		}
 		if response == nil {
 			b.log.V(1).Info("Received nil response from hub")
 			continue
+		}
+		if flow := response.GetFlow(); flow != nil {
+			b.handleFlow(flow)
 		}
 		packet := response.GetPacket()
 		if packet == nil {
@@ -624,26 +1141,187 @@ func (b *hubBridge) readLoop() {
 		b.log.Info("Received packet from hub, enqueueing for local engram", "metadataKeys", len(packet.Metadata))
 		if err := b.enqueuePacket(packet); err != nil {
 			b.log.Error(err, "failed to enqueue hub packet")
+			b.handleDisconnect(client, err)
 			return
 		}
 		b.touch()
 	}
 }
 
+func (b *hubBridge) handleDisconnect(client transportpb.HubService_ProcessClient, err error) {
+	if b == nil {
+		return
+	}
+	if b.ctx.Err() != nil {
+		return
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+		b.log.Info("Hub bridge readLoop exiting", "reason", err.Error())
+		b.notifyHandoff("draining", "hub_disconnected")
+	} else {
+		b.log.Error(err, "hub stream recv failed")
+		b.notifyHandoff("draining", "hub_recv_failed")
+	}
+	b.disconnectCurrent(client)
+}
+
+func (b *hubBridge) disconnectCurrent(client transportpb.HubService_ProcessClient) {
+	if b == nil {
+		return
+	}
+	if client == nil {
+		b.startReconnect("hub_disconnected")
+		return
+	}
+	b.clientMu.Lock()
+	if b.client != client {
+		b.clientMu.Unlock()
+		return
+	}
+	conn := b.conn
+	streamCancel := b.streamCancel
+	b.conn = nil
+	b.client = nil
+	b.streamCancel = nil
+	b.clientMu.Unlock()
+
+	if streamCancel != nil {
+		streamCancel()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	b.startReconnect("hub_disconnected")
+}
+
+func (b *hubBridge) startReconnect(reason string) {
+	if b == nil || b.ctx.Err() != nil {
+		return
+	}
+	b.reconnectMu.Lock()
+	if b.reconnecting {
+		b.reconnectMu.Unlock()
+		return
+	}
+	b.reconnecting = true
+	b.reconnectMu.Unlock()
+	go b.reconnectLoop(reason)
+}
+
+func (b *hubBridge) reconnectLoop(reason string) {
+	defer func() {
+		b.reconnectMu.Lock()
+		b.reconnecting = false
+		b.reconnectMu.Unlock()
+	}()
+	backoff := time.Second
+	for {
+		if b.ctx.Err() != nil {
+			return
+		}
+		conn, client, streamCancel, err := b.openHubStream(b.ctx)
+		if err != nil {
+			b.log.Error(err, "Hub reconnect failed", "reason", reason, "backoff", backoff)
+			jitter := time.Duration(rand.Int63n(int64(backoff / 2)))
+			time.Sleep(backoff + jitter)
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		b.setConnection(conn, client, streamCancel)
+		b.startReadLoop(client)
+		if b.flow != nil {
+			b.flow.reset()
+		}
+		b.notifyHandoff("cutover", "hub_reconnected")
+		b.flushOutboxAsync()
+		return
+	}
+}
+
+func (b *hubBridge) forceReconnect() {
+	if b == nil {
+		return
+	}
+	b.log.Info("Hub bridge hang timeout; reconnecting")
+	client := b.getClient()
+	if client == nil {
+		b.startReconnect("hang_timeout")
+		return
+	}
+	b.disconnectCurrent(client)
+}
+
+func (b *hubBridge) handleFlow(flow *transportpb.FlowControl) {
+	if b == nil || flow == nil {
+		return
+	}
+	if b.onFlow != nil {
+		b.onFlow(flow)
+	}
+}
+
+func (b *hubBridge) notifyHandoff(phase, reason string) {
+	if b == nil || b.onHandoff == nil {
+		return
+	}
+	b.onHandoff(phase, reason)
+}
+
 func (b *hubBridge) Send(packet *transportpb.DataPacket) error {
 	if packet == nil {
 		return nil
 	}
-	err := transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, b.cancel, "hub send", func() error {
-		b.sendMu.Lock()
-		defer b.sendMu.Unlock()
-		return b.client.Send(&transportpb.ProcessRequest{Packet: packet})
-	})
-	if err != nil {
-		return err
+	if b.ctx.Err() != nil {
+		return b.ctx.Err()
+	}
+	client := b.getClient()
+	if client == nil {
+		b.enqueueOutbox(packet, "not_connected")
+		b.startReconnect("send")
+		return nil
+	}
+	if err := b.sendPacket(client, packet); err != nil {
+		b.enqueueOutbox(packet, "send_error")
+		b.handleDisconnect(client, err)
+		return nil
+	}
+	b.touch()
+	b.flushOutboxAsync()
+	return nil
+}
+
+func (b *hubBridge) SendFlow(flow *transportpb.FlowControl) error {
+	if b == nil || flow == nil {
+		return nil
+	}
+	if b.ctx.Err() != nil {
+		return b.ctx.Err()
+	}
+	client := b.getClient()
+	if client == nil {
+		return nil
+	}
+	if err := b.sendFlow(client, flow); err != nil {
+		b.handleDisconnect(client, err)
+		return nil
 	}
 	b.touch()
 	return nil
+}
+
+func (b *hubBridge) RecordDelivery(packet *transportpb.DataPacket) {
+	if b == nil || b.flow == nil {
+		return
+	}
+	flow := b.flow.recordDelivery(packet)
+	if flow == nil {
+		return
+	}
+	if err := b.SendFlow(flow); err != nil {
+		b.log.V(1).Info("Failed to send flow control update", "error", err)
+	}
 }
 
 func (b *hubBridge) Recv() <-chan *transportpb.DataPacket {
@@ -654,14 +1332,37 @@ func (b *hubBridge) Close() {
 	if b.watcher != nil {
 		b.watcher.Stop()
 	}
+	b.notifyHandoff("draining", "bridge_closed")
 	b.cancel()
-	_ = b.client.CloseSend()
-	_ = b.conn.Close()
+	b.closed.Store(true)
+	b.clientMu.Lock()
+	streamCancel := b.streamCancel
+	client := b.client
+	conn := b.conn
+	b.client = nil
+	b.conn = nil
+	b.streamCancel = nil
+	b.clientMu.Unlock()
+	if streamCancel != nil {
+		streamCancel()
+	}
+	if client != nil {
+		_ = client.CloseSend()
+	}
+	if conn != nil {
+		_ = conn.Close()
+	}
+	b.closeOnce.Do(func() {
+		close(b.recvCh)
+	})
 }
 
 func (b *hubBridge) enqueuePacket(packet *transportpb.DataPacket) error {
 	if packet == nil {
 		return nil
+	}
+	if b.closed.Load() {
+		return fmt.Errorf("hub bridge closed")
 	}
 	if b.channelSendTimeout <= 0 {
 		select {
@@ -679,8 +1380,115 @@ func (b *hubBridge) enqueuePacket(packet *transportpb.DataPacket) error {
 	case b.recvCh <- packet:
 		return nil
 	case <-timer.C:
-		return fmt.Errorf("hub channel send timed out after %s", b.channelSendTimeout)
+		b.log.Info("Hub channel send timeout; dropping packet to preserve session",
+			"timeout", b.channelSendTimeout)
+		metrics.RecordConnectorDownstreamDrop(
+			b.cfg.Binding.Reference.Namespace, b.cfg.Binding.Reference.Name, "channel_timeout")
+		return nil
 	}
+}
+
+func (b *hubBridge) sendPacket(client transportpb.HubService_ProcessClient, packet *transportpb.DataPacket) error {
+	if client == nil || packet == nil {
+		return fmt.Errorf("hub stream unavailable")
+	}
+	return transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, nil, "hub send", func() error {
+		b.sendMu.Lock()
+		defer b.sendMu.Unlock()
+		return client.Send(&transportpb.ProcessRequest{Packet: packet})
+	})
+}
+
+func (b *hubBridge) sendFlow(client transportpb.HubService_ProcessClient, flow *transportpb.FlowControl) error {
+	if client == nil || flow == nil {
+		return fmt.Errorf("hub stream unavailable")
+	}
+	return transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, nil, "hub flow send", func() error {
+		b.sendMu.Lock()
+		defer b.sendMu.Unlock()
+		return client.Send(&transportpb.ProcessRequest{Flow: flow})
+	})
+}
+
+func (b *hubBridge) enqueueOutbox(packet *transportpb.DataPacket, reason string) {
+	if b == nil || packet == nil || b.outboxMax <= 0 {
+		return
+	}
+	b.outboxMu.Lock()
+	dropped := 0
+	if len(b.outbox) >= b.outboxMax {
+		overflow := len(b.outbox) - b.outboxMax + 1
+		if overflow < 1 {
+			overflow = 1
+		}
+		b.outbox = b.outbox[overflow:]
+		dropped = overflow
+	}
+	b.outbox = append(b.outbox, packet)
+	b.outboxMu.Unlock()
+	if dropped > 0 {
+		b.log.Info("Hub outbox dropped packets", "dropped", dropped, "reason", reason, "outboxMax", b.outboxMax)
+	}
+}
+
+func (b *hubBridge) flushOutboxAsync() {
+	if b == nil || b.outboxMax <= 0 {
+		return
+	}
+	if !b.flushInProgress.CompareAndSwap(false, true) {
+		return
+	}
+	go func() {
+		defer b.flushInProgress.Store(false)
+		b.flushOutbox()
+	}()
+}
+
+func (b *hubBridge) flushOutbox() {
+	for {
+		batch := b.takeOutbox()
+		if len(batch) == 0 {
+			return
+		}
+		client := b.getClient()
+		if client == nil {
+			b.requeueFront(batch)
+			b.startReconnect("flush")
+			return
+		}
+		for i, packet := range batch {
+			if err := b.sendPacket(client, packet); err != nil {
+				b.requeueFront(batch[i:])
+				b.handleDisconnect(client, err)
+				return
+			}
+		}
+	}
+}
+
+func (b *hubBridge) takeOutbox() []*transportpb.DataPacket {
+	b.outboxMu.Lock()
+	if len(b.outbox) == 0 {
+		b.outboxMu.Unlock()
+		return nil
+	}
+	batch := b.outbox
+	b.outbox = nil
+	b.outboxMu.Unlock()
+	return batch
+}
+
+func (b *hubBridge) requeueFront(packets []*transportpb.DataPacket) {
+	if b == nil || len(packets) == 0 || b.outboxMax <= 0 {
+		return
+	}
+	b.outboxMu.Lock()
+	combined := append(packets, b.outbox...)
+	if len(combined) > b.outboxMax {
+		combined = combined[len(combined)-b.outboxMax:]
+	}
+	b.outbox = combined
+	b.outboxMu.Unlock()
 }
 
 func (b *hubBridge) touch() {
@@ -738,6 +1546,12 @@ func dialHub(ctx context.Context, cfg *Config) (*grpc.ClientConn, error) {
 	return conn, nil
 }
 
+// isPublishHeartbeat returns true when the SDK sent a keepalive on the
+// publish stream (no frame, metadata contains the heartbeat marker).
+func isPublishHeartbeat(req *transportpb.PublishRequest) bool {
+	return req != nil && req.GetFrame() == nil && req.GetMetadata()["bubu-heartbeat"] == "true"
+}
+
 func publishRequestToHubPacket(req *transportpb.PublishRequest) (*transportpb.DataPacket, error) {
 	if req == nil {
 		return nil, fmt.Errorf("publish request is nil")
@@ -747,6 +1561,7 @@ func publishRequestToHubPacket(req *transportpb.PublishRequest) (*transportpb.Da
 		Payload:    cloneStruct(req.GetPayload()),
 		Inputs:     cloneStruct(req.GetInputs()),
 		Transports: cloneTransportDescriptors(req.GetTransports()),
+		Envelope:   cloneStreamEnvelope(req.GetEnvelope()),
 	}
 	switch frame := req.GetFrame().(type) {
 	case *transportpb.PublishRequest_Audio:
@@ -867,6 +1682,9 @@ func mergeDataPackets(dst, src *transportpb.DataPacket) {
 	if len(dst.Transports) == 0 && len(src.Transports) > 0 {
 		dst.Transports = cloneTransportDescriptors(src.Transports)
 	}
+	if dst.Envelope == nil && src.Envelope != nil {
+		dst.Envelope = cloneStreamEnvelope(src.Envelope)
+	}
 }
 
 func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacket) (*transportpb.PublishRequest, error) {
@@ -879,6 +1697,7 @@ func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacke
 		Payload:    cloneStruct(packet.Payload),
 		Inputs:     cloneStruct(packet.Inputs),
 		Transports: cloneTransportDescriptors(packet.Transports),
+		Envelope:   cloneStreamEnvelope(packet.Envelope),
 	}
 
 	// CRITICAL DEBUG: Log exactly what's in the packet
@@ -1118,6 +1937,22 @@ func cloneTransportDescriptors(src []*transportpb.TransportDescriptor) []*transp
 		return nil
 	}
 	return out
+}
+
+func cloneStreamEnvelope(src *transportpb.StreamEnvelope) *transportpb.StreamEnvelope {
+	if src == nil {
+		return nil
+	}
+	return &transportpb.StreamEnvelope{
+		StreamId:   src.GetStreamId(),
+		Sequence:   src.GetSequence(),
+		Partition:  src.GetPartition(),
+		ChunkId:    src.GetChunkId(),
+		ChunkIndex: src.GetChunkIndex(),
+		ChunkCount: src.GetChunkCount(),
+		ChunkBytes: src.GetChunkBytes(),
+		TotalBytes: src.GetTotalBytes(),
+	}
 }
 
 type mediaGate struct {
