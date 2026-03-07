@@ -1031,6 +1031,12 @@ func newHubBridge(ctx context.Context, cfg *Config, log logr.Logger, tunables ru
 		channelSendTimeout: tunables.ChannelSendTimeout,
 	}
 	hb.outboxMax = outboxMaxFromTunables(tunables)
+	if hb.channelSendTimeout > 0 {
+		log.Info("WARNING: channelSendTimeout > 0 is configured. "+
+			"This is a lossy setting — packets may be silently dropped when the receive channel is full. "+
+			"The blocking path (channelSendTimeout = 0) provides better backpressure.",
+			"channelSendTimeout", hb.channelSendTimeout)
+	}
 	var settingsPayload []byte
 	if cfg != nil && cfg.Binding.Info != nil {
 		settingsPayload = cfg.Binding.Info.GetPayload()
