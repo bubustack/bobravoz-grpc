@@ -239,6 +239,15 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 			// Unknown buffer type; drop it for safety
 			sm.deleteBuffer(key)
 		}
+	} else if state != nil {
+		// No buffer found — if state is stuck in cutover (from a previous stream
+		// replacement with no backlog), advance it to ready now.
+		state.mu.Lock()
+		phase := state.handoff.phase
+		state.mu.Unlock()
+		if phase == handoffPhaseCutover {
+			state.setHandoff(handoffPhaseReady, "no_buffer")
+		}
 	}
 	return entry
 }
@@ -713,7 +722,7 @@ func (sm *StreamManager) canSend(state *streamState, packet *transportpb.DataPac
 		if state.creditsMsg <= 0 {
 			return false
 		}
-		if state.creditsBytes > 0 {
+		if state.creditsBytes >= 0 {
 			size := int64(proto.Size(packet))
 			if size > state.creditsBytes {
 				return false
@@ -765,12 +774,16 @@ func (sm *StreamManager) recordSent(state *streamState, packet *transportpb.Data
 			if state.delivery.ordering == orderingPerPartition {
 				partition := packet.GetEnvelope().GetPartition()
 				partitionState := ensurePartitionStateLocked(state, partition, true)
-				partitionState.unacked[seq] = packet
+				if seq > partitionState.lastAck { // only track if not already acked
+					partitionState.unacked[seq] = packet
+				}
 			} else {
 				if state.unacked == nil {
 					state.unacked = make(map[uint64]*transportpb.DataPacket)
 				}
-				state.unacked[seq] = packet
+				if seq > state.lastAck { // only track if not already acked
+					state.unacked[seq] = packet
+				}
 			}
 		}
 	}
@@ -1284,14 +1297,19 @@ func (sm *StreamManager) maybeCheckpoint(state *streamState) {
 			checkpoint.Pending = append(checkpoint.Pending, replayRecord{Seq: seq, Packet: encoded})
 		}
 	}
-	state.lastCheckpoint = now
 	state.mu.Unlock()
 
 	payload, err := json.Marshal(checkpoint)
 	if err != nil {
 		return
 	}
-	_ = sm.storage.WriteBlob(context.Background(), checkpointPath(state), "application/json", payload)
+	if err := sm.storage.WriteBlob(context.Background(), checkpointPath(state), "application/json", payload); err != nil {
+		// Write failed — do not update lastCheckpoint so the next interval retries.
+		return
+	}
+	state.mu.Lock()
+	state.lastCheckpoint = now
+	state.mu.Unlock()
 }
 
 func checkpointPath(state *streamState) string {

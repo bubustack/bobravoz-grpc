@@ -270,6 +270,33 @@ func int32Ptr(v int32) *int32 {
 	return &v
 }
 
+func TestRecordSent_SkipsAlreadyAcked(t *testing.T) {
+	sm := NewStreamManager(nil)
+	delivery := deliveryPolicy{semantics: semanticsAtLeastOnce, ordering: orderingPerStream}
+	key := sm.streamKey("sr", "tenant-a", "step")
+	state := sm.ensureState(key, "sr", "tenant-a", "step",
+		flowControlPolicy{}, delivery, defaultBufferLimits(), 0)
+
+	state.mu.Lock()
+	state.lastAck = 5
+	if state.unacked == nil {
+		state.unacked = make(map[uint64]*transportpb.DataPacket)
+	}
+	state.mu.Unlock()
+
+	pkt := &transportpb.DataPacket{
+		Envelope: &transportpb.StreamEnvelope{Sequence: 3}, // already acked (3 <= 5)
+	}
+	sm.recordSent(state, pkt)
+
+	state.mu.Lock()
+	_, present := state.unacked[3]
+	state.mu.Unlock()
+	if present {
+		t.Error("already-acked seq 3 should not be inserted into unacked map")
+	}
+}
+
 // TestEnsureStateConcurrent verifies that concurrent calls to ensureState for the
 // same key all return the same *streamState pointer (no TOCTOU race).
 func TestEnsureStateConcurrent(t *testing.T) {
