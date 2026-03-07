@@ -1473,9 +1473,13 @@ func (sm *StreamManager) SendHeartbeats(ctx context.Context) error {
 		}
 		stream := entry.stream
 
+		// Clone per stream: concurrent Send calls must not share the same
+		// proto message because the gRPC serializer may mutate fields (e.g.
+		// cached size). Using a fresh clone per stream prevents data races.
+		pkt := proto.Clone(heartbeatPacket).(*transportpb.DataPacket)
 		// Use a timeout for sending heartbeats to avoid blocking the loop.
 		sendCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		if err := stream.Send(sendCtx, heartbeatPacket); err != nil {
+		if err := stream.Send(sendCtx, pkt); err != nil {
 			sm.log.Error(err, "Failed to send heartbeat", "key", key)
 			errs = append(errs, fmt.Errorf("%v: %w", key, err))
 		}
