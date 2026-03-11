@@ -36,6 +36,7 @@ import (
 
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
+	"github.com/bubustack/bobrapet/pkg/conditions"
 	"github.com/bubustack/bobrapet/pkg/enums"
 	"github.com/bubustack/bobrapet/pkg/refs"
 	"github.com/bubustack/bobrapet/pkg/storage"
@@ -74,6 +75,7 @@ const (
 	metaStoryRunName         = "storyrun-name"
 	metaStoryRunNS           = "storyrun-namespace"
 	metaCurrentStepID        = "current-step-id"
+	metaConnectorGeneration  = "connector-generation"
 	metaJoinKey              = "bubu.join.key"
 	metaEnvelopeMessageIDKey = "bubu.envelope.message_id"
 	trueString               = "true"
@@ -107,6 +109,7 @@ type Server struct {
 	offloadedPolicy       string
 	materializeEngram     string
 	maxDownstreamsHardCap int
+	substoryReporter      *substoryReporter
 	cycles                *cycleTracker
 	closeOnce             sync.Once
 	hookMu                sync.Mutex
@@ -184,12 +187,17 @@ func NewServer(ctx context.Context, k8sClient client.Client, templateCfg templat
 	if err != nil {
 		return nil, fmt.Errorf("failed to create template evaluator: %w", err)
 	}
+	sm := NewStreamManager(storageMgr)
+	reporter := newHandoffReporter(k8sClient, logger.WithName("handoff"))
+	sm.SetOnHandoffChange(reporter.report)
+	subReporter := newSubstoryReporter(k8sClient, logger.WithName("substory"))
+
 	return &Server{
 		client:                k8sClient,
 		cache:                 cache,
 		log:                   logger,
 		templateEvaluator:     templateEvaluator,
-		streamManager:         NewStreamManager(storageMgr),
+		streamManager:         sm,
 		storageManager:        storageMgr,
 		joinCache:             newJoinCache(logger),
 		templateSchemaCache:   newTemplateSchemaCache(k8sClient),
@@ -197,6 +205,7 @@ func NewServer(ctx context.Context, k8sClient client.Client, templateCfg templat
 		offloadedPolicy:       strings.TrimSpace(offloadedPolicy),
 		materializeEngram:     strings.TrimSpace(materializeEngram),
 		maxDownstreamsHardCap: getMaxDownstreamsHardCap(),
+		substoryReporter:      subReporter,
 		cycles:                newCycleTracker(),
 		emittedHooks:          make(map[string]struct{}),
 	}, nil
@@ -490,8 +499,9 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	meta := stagemeta.StoryRunMetadata(storyRunName, storyRunNS).WithStep(currentStepID)
 	meta.Info(s.log, "Hub stream metadata extracted")
 
-	meta.Info(s.log, "Registering stream")
-	streamEntry := s.streamManager.AddStream(ctx, storyRunName, storyRunNS, currentStepID, stream)
+	connectorGen := parseConnectorGeneration(md)
+	meta.Info(s.log, "Registering stream", "connectorGeneration", connectorGen)
+	streamEntry := s.streamManager.AddStream(ctx, storyRunName, storyRunNS, currentStepID, stream, connectorGen)
 	if streamEntry == nil {
 		err := status.Error(codes.ResourceExhausted, "hub max active streams reached")
 		streamContract.Failure("register", err)
@@ -499,7 +509,10 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	}
 	s.maybeEmitLifecycleHooks(ctx, storyRunName, storyRunNS, currentStepID)
 	meta.Info(s.log, "Hub stream registered successfully")
-	defer s.streamManager.RemoveStream(storyRunName, storyRunNS, currentStepID, streamEntry)
+	defer func() {
+		s.streamManager.RemoveStream(storyRunName, storyRunNS, currentStepID, streamEntry)
+		s.maybeSignalTopologyTerminated(storyRunName, storyRunNS)
+	}()
 	streamContract = streamContract.WithStage(meta)
 	streamContract.Success("register")
 
@@ -753,6 +766,56 @@ func (s *Server) allStreamingStepStreamsConnected(story *bubuv1alpha1.Story, sto
 		}
 	}
 	return hasStreamingStep
+}
+
+// maybeSignalTopologyTerminated checks whether ALL streaming steps for a
+// StoryRun have disconnected from the hub. When they have, it sets a
+// Degraded condition on the StoryRun so the controller can trigger
+// compensation/finally cleanup phases.
+func (s *Server) maybeSignalTopologyTerminated(storyRunName, storyRunNS string) {
+	if storyRunName == "" || storyRunNS == "" {
+		return
+	}
+	// Look up the Story to enumerate streaming steps.
+	_, story, err := s.getStoryAndRunWithRetry(context.Background(), storyRunName, storyRunNS)
+	if err != nil || story == nil {
+		return
+	}
+
+	// Check if ANY streaming step still has an active stream.
+	hasStreamingStep := false
+	for i := range story.Spec.Steps {
+		step := &story.Spec.Steps[i]
+		if step == nil || step.Ref == nil || strings.TrimSpace(step.Transport) == "" {
+			continue
+		}
+		stepID := getStepID(step)
+		if stepID == "" {
+			continue
+		}
+		hasStreamingStep = true
+		if s.streamManager.HasStream(storyRunName, storyRunNS, stepID) {
+			return // At least one stream is still active — not terminated yet.
+		}
+	}
+	if !hasStreamingStep {
+		return
+	}
+
+	// All streaming steps disconnected — signal topology termination.
+	// Use a dedup key to ensure we only signal once per StoryRun.
+	dedupKey := fmt.Sprintf("topology-terminated:%s/%s", storyRunNS, storyRunName)
+	if !s.claimLifecycleHook(dedupKey) {
+		return
+	}
+	s.log.Info("All streaming steps disconnected; signaling topology termination",
+		"storyRun", storyRunName, "namespace", storyRunNS)
+
+	s.substoryReporter.patchParentDegraded(
+		storyRunName, storyRunNS,
+		conditions.ReasonTopologyTerminated,
+		"streaming topology terminated: all streaming steps disconnected",
+	)
 }
 
 func lifecycleHookDedupKey(storyRunNS, storyRunName, eventName, stepID string) string {
@@ -1748,12 +1811,120 @@ func (s *Server) handleBatchEngramIfNeeded(
 		return false, nil
 	}
 
-	if err := s.createBatchStepRun(ctx, storyRun, story, step, evaluatedInputs, currentStepID); err != nil {
-		s.log.Error(err, "Failed to create StepRun for batch engram", "step", getStepID(step))
+	stepID := getStepID(step)
+	stepRunName, err := s.createBatchStepRun(ctx, storyRun, story, step, evaluatedInputs, currentStepID)
+	if err != nil {
+		s.log.Error(err, "Failed to create StepRun for batch engram", "step", stepID)
+		s.substoryReporter.reportStepFailure(storyRun.Name, storyRun.Namespace, stepID, err.Error())
 		return true, status.Errorf(codes.Internal, "failed to create StepRun for batch step: %v", err)
 	}
 
+	// Wait for the batch StepRun to complete so downstream steps can use its output.
+	// Apply step-level timeout if configured; otherwise use the parent context deadline.
+	waitCtx := ctx
+	if timeout := s.resolveStreamingStepTimeout(step, story); timeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	s.log.Info("Waiting for batch step completion", "storyRun", storyRun.Name, "step", stepID, "stepRun", stepRunName)
+	completedRun, err := s.waitForBatchStepCompletion(waitCtx, types.NamespacedName{
+		Namespace: storyRun.Namespace,
+		Name:      stepRunName,
+	})
+	if err != nil {
+		s.substoryReporter.reportStepFailure(storyRun.Name, storyRun.Namespace, stepID, err.Error())
+		return true, status.Errorf(codes.Internal, "batch step %q failed to complete: %v", stepID, err)
+	}
+
+	if completedRun.Status.Phase != enums.PhaseSucceeded && completedRun.Status.Phase != enums.PhaseSkipped {
+		msg := completedRun.Status.LastFailureMsg
+		if strings.TrimSpace(msg) == "" {
+			msg = fmt.Sprintf("batch step completed with phase %s", completedRun.Status.Phase)
+		}
+		s.substoryReporter.reportStepFailure(storyRun.Name, storyRun.Namespace, stepID, msg)
+		return true, status.Errorf(codes.Internal, "batch step %q failed: %s", stepID, msg)
+	}
+
+	// Read the batch output and route downstream. By calling processPacket with the
+	// batch step as currentStepID, findNextDependentStep will discover its downstream
+	// steps and route the batch output into the streaming pipeline.
+	outputPayload, err := rawExtensionToStruct(completedRun.Status.Output)
+	if err != nil {
+		s.log.Error(err, "Failed to parse batch step output", "step", stepID)
+		// Continue with empty payload — downstream may not need batch output.
+		outputPayload = nil
+	}
+
+	syntheticPacket := &transportpb.DataPacket{}
+	if outputPayload != nil {
+		syntheticPacket.Payload = outputPayload
+	}
+	if routeErr := s.processPacket(ctx, storyRun.Name, storyRun.Namespace, stepID, syntheticPacket); routeErr != nil {
+		return true, routeErr
+	}
+
 	return true, nil
+}
+
+// waitForBatchStepCompletion polls for a StepRun to reach a terminal phase
+// using exponential backoff (200ms → 1s → 2s, capped at 5s).
+func (s *Server) waitForBatchStepCompletion(ctx context.Context, key types.NamespacedName) (*runsv1alpha1.StepRun, error) {
+	interval := 200 * time.Millisecond
+	const maxInterval = 5 * time.Second
+	for {
+		var stepRun runsv1alpha1.StepRun
+		if err := s.client.Get(ctx, key, &stepRun); err != nil {
+			if apierrors.IsNotFound(err) {
+				if err := sleepContext(ctx, interval); err != nil {
+					return nil, err
+				}
+				interval = nextBackoff(interval, maxInterval)
+				continue
+			}
+			return nil, fmt.Errorf("batch step get failed: %w", err)
+		}
+		if stepRun.Status.Phase.IsTerminal() && stepRun.Status.Phase != "" {
+			return &stepRun, nil
+		}
+		if err := sleepContext(ctx, interval); err != nil {
+			return nil, err
+		}
+		interval = nextBackoff(interval, maxInterval)
+	}
+}
+
+// sleepContext blocks for d or until ctx is canceled, whichever comes first.
+func sleepContext(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
+// nextBackoff doubles the interval up to max.
+func nextBackoff(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		return max
+	}
+	return next
+}
+
+// rawExtensionToStruct converts a RawExtension (JSON) to a protobuf Struct.
+func rawExtensionToStruct(raw *k8sruntime.RawExtension) (*structpb.Struct, error) {
+	if raw == nil || len(raw.Raw) == 0 {
+		return nil, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw.Raw, &m); err != nil {
+		return nil, err
+	}
+	return structpb.NewStruct(m)
 }
 
 func (s *Server) forwardToRealtimeStep(
@@ -1835,19 +2006,6 @@ func (s *Server) forwardHotPacket(
 	}
 	nextEngramStepID := getStepID(nextEngramStep)
 
-	// DEBUG: Log incoming packet audio state
-	inHasAudio := originalPacket.GetAudio() != nil
-	inAudioPcmLen := 0
-	if inHasAudio {
-		inAudioPcmLen = len(originalPacket.GetAudio().GetPcm())
-	}
-	s.log.Info("[HUB_FORWARD] Incoming packet",
-		"storyRun", storyRun.Name,
-		"from", originalPacket.Metadata["current-step-id"],
-		"to", nextEngramStepID,
-		"hasAudio", inHasAudio,
-		"audioPcmLen", inAudioPcmLen)
-
 	out := &transportpb.DataPacket{
 		Metadata:   copyMetadataForStep(originalPacket.Metadata, storyRun.Name, storyRun.Namespace, nextEngramStepID),
 		Payload:    cloneStruct(originalPacket.GetPayload()),
@@ -1858,18 +2016,6 @@ func (s *Server) forwardHotPacket(
 		Video:      cloneVideoFrame(originalPacket.GetVideo()),
 		Binary:     cloneBinaryFrame(originalPacket.GetBinary()),
 	}
-
-	// DEBUG: Log outgoing packet audio state after cloning
-	outHasAudio := out.GetAudio() != nil
-	outAudioPcmLen := 0
-	if outHasAudio {
-		outAudioPcmLen = len(out.GetAudio().GetPcm())
-	}
-	s.log.Info("[HUB_FORWARD] Outgoing packet after clone",
-		"storyRun", storyRun.Name,
-		"to", nextEngramStepID,
-		"hasAudio", outHasAudio,
-		"audioPcmLen", outAudioPcmLen)
 
 	retryPolicy := resolveStreamingRetryPolicy(nextEngramStep, story)
 	sendCtx, cancel := s.contextWithStepTimeout(ctx, nextEngramStep, story)
@@ -2100,22 +2246,19 @@ func serverKeepaliveOptionFromEnv() (grpc.ServerOption, bool) {
 	return grpc.KeepaliveParams(kaParams), true
 }
 
-// createBatchStepRun creates a StepRun for a batch (job-mode) engram step.
-// If inputs is provided in the incoming packet, it is treated as pre-resolved and passed through.
+const maxBatchInputBytes = 1 << 20 // 1 MiB — leave headroom below etcd's ~1.5 MiB per-object limit
+
+// createBatchStepRun creates a StepRun for a batch (job-mode) engram step and
+// returns the generated StepRun name so callers can poll for completion.
 //
 // Workarounds for hybrid streaming→batch transitions:
 //  1. Keep packet inputs small by using references/IDs instead of full payloads (recommended)
 //  2. Use storage references in upstream engram outputs (store large data in S3, pass reference)
 //  3. Split large payloads across multiple messages if feasible
 //
-// Design rationale: Hub-side storage offload requires careful error handling, retry logic, and cleanup
-// on partial writes. The current design intentionally enforces the 1 MiB inline limit to maintain
-// simplicity and reliability. Future enhancement may add Hub-side offload if hybrid patterns with
-// large payloads become common. For now, the inline limit is enforced with a clear error message.
-//
 // Technical details: Kubernetes etcd has a ~1.5 MiB hard limit per object. We enforce 1 MiB for inputs
 // to leave headroom for metadata, labels, and annotations in the StepRun CR.
-func (s *Server) createBatchStepRun(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story, step *bubuv1alpha1.Step, inputs *structpb.Struct, upstreamStepID string) error {
+func (s *Server) createBatchStepRun(ctx context.Context, storyRun *runsv1alpha1.StoryRun, story *bubuv1alpha1.Story, step *bubuv1alpha1.Step, inputs *structpb.Struct, upstreamStepID string) (string, error) {
 	stepID := getStepID(step)
 	name := generateStepRunName(storyRun.Name, stepID, time.Now())
 
@@ -2142,7 +2285,10 @@ func (s *Server) createBatchStepRun(ctx context.Context, storyRun *runsv1alpha1.
 	if inputs != nil {
 		b, err := json.Marshal(inputs.AsMap())
 		if err != nil {
-			return fmt.Errorf("failed to marshal inputs: %w", err)
+			return "", fmt.Errorf("failed to marshal inputs: %w", err)
+		}
+		if len(b) > maxBatchInputBytes {
+			return "", fmt.Errorf("batch step %q input size %d bytes exceeds limit of %d bytes; use storage references for large payloads", stepID, len(b), maxBatchInputBytes)
 		}
 
 		stepRun.Spec.Input = &k8sruntime.RawExtension{Raw: b}
@@ -2155,7 +2301,7 @@ func (s *Server) createBatchStepRun(ctx context.Context, storyRun *runsv1alpha1.
 		stepRun.Spec.Input = step.With
 	}
 
-	return s.client.Create(ctx, stepRun)
+	return name, s.client.Create(ctx, stepRun)
 }
 
 func (s *Server) evaluatePrimitive(ctx context.Context, storyRun *runsv1alpha1.StoryRun, step *bubuv1alpha1.Step, payload *structpb.Struct, steps map[string]any, storyInputs map[string]any) (*structpb.Struct, error) {
@@ -2312,48 +2458,56 @@ func (s *Server) evaluateExecuteStoryPrimitive(
 	}
 
 	waitForCompletion := cfg.WaitForCompletion != nil && *cfg.WaitForCompletion
-	if waitForCompletion {
-		s.log.Info("executeStory waiting for sub-story completion", "storyRun", storyRun.Name, "step", getStepID(step), "subRun", subRunName)
-		subRun, err := s.waitForSubStoryCompletion(ctx, types.NamespacedName{Namespace: storyRun.Namespace, Name: subRunName})
-		if err != nil {
-			return payload, err
-		}
-		if subRun.Status.Phase == enums.PhaseSucceeded || subRun.Status.Phase == enums.PhaseSkipped {
-			return payload, nil
-		}
-		message := subRun.Status.Message
-		if strings.TrimSpace(message) == "" {
-			message = fmt.Sprintf("Sub-story run '%s' completed with phase %s", subRun.Name, subRun.Status.Phase)
-		}
-		return payload, fmt.Errorf("executeStory step %q failed: %s", getStepID(step), message)
+	if !waitForCompletion {
+		// Fire-and-forget: start background watcher so child failures are
+		// reported on the parent StoryRun's Degraded condition.
+		s.substoryReporter.watchFireAndForget(storyRun.Name, storyRun.Namespace, subRunName, getStepID(step))
+		return payload, nil
 	}
-	return payload, nil
+	// Apply step-level timeout to prevent unbounded blocking.
+	waitCtx := ctx
+	if timeout := s.resolveStreamingStepTimeout(step, nil); timeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	s.log.Info("executeStory waiting for sub-story completion", "storyRun", storyRun.Name, "step", getStepID(step), "subRun", subRunName)
+	completedSub, err := s.waitForSubStoryCompletion(waitCtx, types.NamespacedName{Namespace: storyRun.Namespace, Name: subRunName})
+	if err != nil {
+		return payload, err
+	}
+	if completedSub.Status.Phase == enums.PhaseSucceeded || completedSub.Status.Phase == enums.PhaseSkipped {
+		return payload, nil
+	}
+	message := completedSub.Status.Message
+	if strings.TrimSpace(message) == "" {
+		message = fmt.Sprintf("Sub-story run '%s' completed with phase %s", completedSub.Name, completedSub.Status.Phase)
+	}
+	return payload, fmt.Errorf("executeStory step %q failed: %s", getStepID(step), message)
 }
 
 func (s *Server) waitForSubStoryCompletion(ctx context.Context, key types.NamespacedName) (*runsv1alpha1.StoryRun, error) {
-	ticker := time.NewTicker(executeStoryPollInterval)
-	defer ticker.Stop()
+	interval := 200 * time.Millisecond
+	const maxInterval = 5 * time.Second
 	for {
 		var subRun runsv1alpha1.StoryRun
 		if err := s.client.Get(ctx, key, &subRun); err != nil {
 			if apierrors.IsNotFound(err) {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-ticker.C:
-					continue
+				if err := sleepContext(ctx, interval); err != nil {
+					return nil, err
 				}
+				interval = nextBackoff(interval, maxInterval)
+				continue
 			}
 			return nil, fmt.Errorf("executeStory waitForCompletion get failed: %w", err)
 		}
 		if subRun.Status.Phase.IsTerminal() && subRun.Status.Phase != "" {
 			return &subRun, nil
 		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-ticker.C:
+		if err := sleepContext(ctx, interval); err != nil {
+			return nil, err
 		}
+		interval = nextBackoff(interval, maxInterval)
 	}
 }
 
@@ -2686,6 +2840,20 @@ func (s *Server) extractMetadata(md metadata.MD) (storyRunName, storyRunNS, curr
 		return "", "", "", errors.New("missing current-step-id metadata")
 	}
 	return md[metaStoryRunName][0], md[metaStoryRunNS][0], md[metaCurrentStepID][0], nil
+}
+
+// parseConnectorGeneration extracts the connector generation from gRPC metadata.
+// Returns 0 if not present (backwards compatible with connectors that don't send it).
+func parseConnectorGeneration(md metadata.MD) int32 {
+	vals := md.Get(metaConnectorGeneration)
+	if len(vals) == 0 || strings.TrimSpace(vals[0]) == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(vals[0]), 10, 32)
+	if err != nil {
+		return 0
+	}
+	return int32(n)
 }
 
 func metadataValue(md metadata.MD, key string) string {
