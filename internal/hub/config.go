@@ -44,3 +44,11 @@ func getEvictionInterval() time.Duration {
 	}
 	return 1 * time.Minute // default
 }
+
+func getMaxDownstreamsHardCap() int {
+	valStr := os.Getenv(contracts.HubMaxDownstreamsEnv)
+	if val, err := strconv.Atoi(valStr); err == nil && val > 0 {
+		return val
+	}
+	return 64
+}

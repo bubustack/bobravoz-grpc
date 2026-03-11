@@ -35,6 +35,11 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 		metadataEnvelopeTimeKey:      "42",
 		"storyRun":                   "sr-audio",
 	}
+	req.Envelope = &transportpb.StreamEnvelope{
+		StreamId:  "stream-1",
+		Sequence:  7,
+		Partition: "p1",
+	}
 	req.Payload = payloadStruct
 	req.Inputs = inputsStruct
 	req.Transports = []*transportpb.TransportDescriptor{
@@ -60,6 +65,9 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 	if len(packet.Transports) != 1 || packet.Transports[0].GetName() != "livekit" {
 		t.Fatalf("transports not propagated: %#v", packet.Transports)
 	}
+	if got := packet.GetEnvelope(); got == nil || got.GetStreamId() != "stream-1" || got.GetSequence() != 7 {
+		t.Fatalf("envelope not propagated: %#v", packet.GetEnvelope())
+	}
 
 	roundTrip, err := hubPacketToPublishRequest(logr.Discard(), packet)
 	if err != nil {
@@ -80,6 +88,9 @@ func TestPublishRequestAudioRoundTrip(t *testing.T) {
 	}
 	if len(roundTrip.GetTransports()) != 1 || roundTrip.GetTransports()[0].GetName() != "livekit" {
 		t.Fatalf("transports missing on roundtrip: %#v", roundTrip.GetTransports())
+	}
+	if got := roundTrip.GetEnvelope(); got == nil || got.GetStreamId() != "stream-1" || got.GetSequence() != 7 {
+		t.Fatalf("envelope missing on roundtrip: %#v", got)
 	}
 }
 

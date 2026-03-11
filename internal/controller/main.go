@@ -68,6 +68,7 @@ type recorderAwareTransport interface {
 
 // +kubebuilder:rbac:groups=bubustack.io,resources=stories,verbs=get;list;watch
 // +kubebuilder:rbac:groups=bubustack.io,resources=engrams,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups=catalog.bubustack.io,resources=engramtemplates,verbs=get;list;watch
 // +kubebuilder:rbac:groups=runs.bubustack.io,resources=storyruns,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=runs.bubustack.io,resources=storyruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=runs.bubustack.io,resources=storyruns/finalizers,verbs=update
@@ -75,6 +76,7 @@ type recorderAwareTransport interface {
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups=transport.bubustack.io,resources=transports,verbs=get;list;watch
 // +kubebuilder:rbac:groups=transport.bubustack.io,resources=transportbindings,verbs=get;list;watch
 // +kubebuilder:rbac:groups=transport.bubustack.io,resources=transportbindings/status,verbs=get;update;patch
 

@@ -16,3 +16,5 @@ spec:
   issuerRef:
     kind: ClusterIssuer
     name: bobrapet-shared-ca
+  privateKey:
+    rotationPolicy: Always

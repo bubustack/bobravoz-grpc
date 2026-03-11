@@ -43,7 +43,8 @@ import (
 // (legacy Buffer type removed; MessageBuffer is used instead)
 
 type streamEntry struct {
-	stream *Stream
+	stream     *Stream
+	generation int32 // connector generation for blue-green handoff
 }
 
 // StreamOptions captures per-stream delivery and flow-control settings.
@@ -73,6 +74,7 @@ const (
 	handoffPhaseDraining = "draining"
 	handoffPhaseCutover  = "cutover"
 	handoffPhaseReady    = "ready"
+	handoffPhaseWarming  = "warming"
 )
 
 type handoffState struct {
@@ -80,6 +82,9 @@ type handoffState struct {
 	reason    string
 	updatedAt time.Time
 }
+
+// HandoffCallback is invoked asynchronously when a stream's handoff phase changes.
+type HandoffCallback func(storyRunName, storyRunNamespace, stepID, phase, reason string)
 
 type streamState struct {
 	mu                sync.Mutex
@@ -102,11 +107,19 @@ type streamState struct {
 	replayLoaded      bool
 	maxInFlight       int
 	handoff           handoffState
+	onHandoffChange   HandoffCallback
+
+	// Blue-green handoff: shadow stream support.
+	// generation tracks the connector generation of the current active stream.
+	generation int32
+	// shadowGeneration tracks the connector generation of the shadow (green) stream.
+	shadowGeneration int32
 }
 
 // StreamManager manages all active client streams.
 type StreamManager struct {
 	streams           sync.Map // map[streamKey]*streamEntry
+	shadows           sync.Map // map[streamKey]*streamEntry (blue-green shadow streams)
 	buffers           sync.Map // map[streamKey]*MessageBuffer
 	states            sync.Map // map[streamKey]*streamState
 	storage           *storage.StorageManager
@@ -119,6 +132,13 @@ type StreamManager struct {
 	bufferCount       atomic.Int64
 	maxActiveStreams  int
 	maxBuffers        int
+	onHandoffChange   HandoffCallback
+}
+
+// SetOnHandoffChange registers a callback invoked whenever a stream's handoff
+// phase transitions. Must be called before any streams are added.
+func (sm *StreamManager) SetOnHandoffChange(cb HandoffCallback) {
+	sm.onHandoffChange = cb
 }
 
 // NewStreamManager creates a new StreamManager.
@@ -174,28 +194,78 @@ func (sm *StreamManager) HasStream(storyRunName, storyRunNamespace, stepID strin
 }
 
 // AddStream adds a new stream to the manager and returns its entry handle.
-func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNamespace, stepID string, grpcStream transportpb.HubService_ProcessServer) *streamEntry {
+// connectorGen is the connector generation (0 means legacy/unset). When a stream
+// arrives with a higher generation than the current active stream, it is stored as
+// a shadow (green) stream for blue-green handoff instead of replacing the active one.
+func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNamespace, stepID string, grpcStream transportpb.HubService_ProcessServer, connectorGen ...int32) *streamEntry {
 	key := sm.streamKey(storyRunName, storyRunNamespace, stepID)
 	if sm.maxActiveStreams > 0 && sm.activeCount.Load() >= int64(sm.maxActiveStreams) {
 		sm.log.Info("Rejecting stream; max active streams reached", "key", key, "maxActiveStreams", sm.maxActiveStreams)
 		metrics.RecordHubMessageDropped(storyRunName, stepID, "max_active_streams")
 		return nil
 	}
+
+	var gen int32
+	if len(connectorGen) > 0 {
+		gen = connectorGen[0]
+	}
+
 	stream := newStream(ctx, grpcStream, getChannelBufferSize())
-	entry := &streamEntry{stream: stream}
+	entry := &streamEntry{stream: stream, generation: gen}
+
+	state := sm.ensureState(key, storyRunName, storyRunNamespace, stepID, flowControlPolicy{}, deliveryPolicy{}, defaultBufferLimits(), 0)
+
+	// Blue-green: if a higher generation arrives while an active stream exists,
+	// store it as shadow instead of replacing the active stream.
+	if gen > 0 && state != nil {
+		state.mu.Lock()
+		activeGen := state.generation
+		state.mu.Unlock()
+
+		if activeGen > 0 && gen > activeGen {
+			// Higher generation — store as shadow (green) stream.
+			// If a previous shadow exists, replace it (third connector scenario).
+			if prev, ok := sm.shadows.Load(key); ok {
+				if prevEntry, ok := prev.(*streamEntry); ok {
+					prevEntry.stream.Close()
+				}
+			}
+			sm.shadows.Store(key, entry)
+			sm.activeCount.Add(1)
+			state.mu.Lock()
+			state.shadowGeneration = gen
+			state.mu.Unlock()
+			state.setHandoff(handoffPhaseWarming, "shadow_connected")
+			sm.log.Info("Shadow stream added (blue-green warming)",
+				"key", key, "activeGen", activeGen, "shadowGen", gen)
+
+			// Auto-cutover: immediately promote shadow to active.
+			// Future: add configurable warmup delay here.
+			sm.CutoverShadow(storyRunName, storyRunNamespace, stepID)
+
+			return entry
+		}
+	}
+
+	// Normal path: replace the active stream.
 	_, hadStream := sm.streams.Load(key)
 	sm.streams.Store(key, entry)
-	sm.log.Info("Stream added", "key", key)
+	sm.log.Info("Stream added", "key", key, "generation", gen)
 	sm.activeCount.Add(1)
 
-	baseCtx := safeStreamContext(grpcStream, ctx)
-	state := sm.ensureState(key, storyRunName, storyRunNamespace, stepID, flowControlPolicy{}, deliveryPolicy{}, defaultBufferLimits(), 0)
 	if state != nil {
+		state.mu.Lock()
+		state.generation = gen
+		state.mu.Unlock()
 		if hadStream {
 			state.setHandoff(handoffPhaseCutover, "stream_replaced")
 		} else {
 			state.setHandoff(handoffPhaseReady, "stream_connected")
 		}
+	}
+
+	baseCtx := safeStreamContext(grpcStream, ctx)
+	if state != nil {
 		sm.replayUnacked(baseCtx, state, stream)
 	}
 
@@ -203,9 +273,6 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 	if val, ok := sm.buffers.Load(key); ok {
 		if buffer, ok := val.(*MessageBuffer); ok {
 			sm.log.Info("Draining buffer for stream", "key", key, "size", buffer.Size())
-			// Flush buffered messages synchronously to ensure deterministic test behavior
-			// Use the stream's context when available; guard against test mocks without a valid context
-			// baseCtx already computed for this stream
 			_, flushErr := buffer.FlushWithSenderAndPolicy(baseCtx, func(p *transportpb.DataPacket) error {
 				sendCtx := baseCtx
 				if sm.perMessageTimeout > 0 {
@@ -224,7 +291,7 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 			buffer.RecordFlushResult(flushErr, sm.retryBase, sm.retryMax)
 			sm.updatePauseResume(key, buffer, state)
 			if buffer.Size() == 0 {
-				sm.deleteBuffer(key) // Buffer drained completely
+				sm.deleteBuffer(key)
 				sm.markBufferDrained(key, state, "buffer_drained")
 			} else {
 				sm.log.Info("Buffer partially flushed; retaining for retry",
@@ -236,12 +303,9 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 				}
 			}
 		} else {
-			// Unknown buffer type; drop it for safety
 			sm.deleteBuffer(key)
 		}
 	} else if state != nil {
-		// No buffer found — if state is stuck in cutover (from a previous stream
-		// replacement with no backlog), advance it to ready now.
 		state.mu.Lock()
 		phase := state.handoff.phase
 		state.mu.Unlock()
@@ -267,18 +331,42 @@ func safeStreamContext(gs transportpb.HubService_ProcessServer, fallback context
 	}
 	logger.Error(fmt.Errorf("gRPC stream provided nil context and no fallback"),
 		"BUG: creating canceled context to avoid leaks")
-	ctx, cancel := context.WithCancel(context.TODO())
+	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	return ctx
 }
 
 // RemoveStream removes a stream from the manager when the supplied entry still matches.
+// It also handles shadow stream removal for blue-green handoff.
 func (sm *StreamManager) RemoveStream(storyRunName, storyRunNamespace, stepID string, entry *streamEntry) {
 	if entry == nil {
 		return
 	}
 	key := sm.streamKey(storyRunName, storyRunNamespace, stepID)
 	entry.stream.Close()
+
+	// Check if this entry is the shadow stream.
+	if shadowVal, ok := sm.shadows.Load(key); ok {
+		if shadowVal == entry {
+			sm.shadows.Delete(key)
+			sm.activeCount.Add(-1)
+			sm.log.Info("Shadow stream removed", "key", key)
+			// If active stream is still running, return to ready.
+			if _, hasActive := sm.streams.Load(key); hasActive {
+				if stateVal, ok := sm.states.Load(key); ok {
+					if state, ok := stateVal.(*streamState); ok {
+						state.mu.Lock()
+						state.shadowGeneration = 0
+						state.mu.Unlock()
+						state.setHandoff(handoffPhaseReady, "shadow_removed")
+					}
+				}
+			}
+			return
+		}
+	}
+
+	// Check if this entry is the active stream.
 	if val, ok := sm.streams.Load(key); ok {
 		if val == entry {
 			sm.streams.Delete(key)
@@ -293,6 +381,65 @@ func (sm *StreamManager) RemoveStream(storyRunName, storyRunNamespace, stepID st
 		}
 	}
 	sm.log.V(1).Info("Skip removing stream; newer stream active", "key", key)
+}
+
+// CutoverShadow atomically promotes the shadow (green) stream to active and
+// signals the old (blue) stream to drain. Returns true if cutover succeeded.
+func (sm *StreamManager) CutoverShadow(storyRunName, storyRunNamespace, stepID string) bool {
+	key := sm.streamKey(storyRunName, storyRunNamespace, stepID)
+
+	shadowVal, hasShadow := sm.shadows.Load(key)
+	if !hasShadow {
+		sm.log.V(1).Info("CutoverShadow: no shadow stream", "key", key)
+		return false
+	}
+	shadowEntry, ok := shadowVal.(*streamEntry)
+	if !ok || shadowEntry == nil {
+		return false
+	}
+
+	// Swap: shadow becomes active, old active is closed.
+	oldVal, hadOld := sm.streams.Load(key)
+	sm.streams.Store(key, shadowEntry)
+	sm.shadows.Delete(key)
+	sm.log.Info("Blue-green cutover: shadow promoted to active", "key", key,
+		"shadowGen", shadowEntry.generation)
+
+	// Update state with new generation.
+	if stateVal, ok := sm.states.Load(key); ok {
+		if state, ok := stateVal.(*streamState); ok {
+			state.mu.Lock()
+			state.generation = shadowEntry.generation
+			state.shadowGeneration = 0
+			state.mu.Unlock()
+			state.setHandoff(handoffPhaseCutover, "blue_green_cutover")
+		}
+	}
+
+	// Close old (blue) stream — it will drain in-flight messages.
+	if hadOld {
+		if oldEntry, ok := oldVal.(*streamEntry); ok && oldEntry != nil {
+			oldEntry.stream.Close()
+			sm.activeCount.Add(-1)
+		}
+	}
+
+	// Advance to ready if no buffer pending.
+	if _, hasBuf := sm.buffers.Load(key); !hasBuf {
+		if stateVal, ok := sm.states.Load(key); ok {
+			if state, ok := stateVal.(*streamState); ok {
+				state.setHandoff(handoffPhaseReady, "cutover_complete")
+			}
+		}
+	}
+	return true
+}
+
+// HasShadow reports whether a shadow stream exists for the given step key.
+func (sm *StreamManager) HasShadow(storyRunName, storyRunNamespace, stepID string) bool {
+	key := sm.streamKey(storyRunName, storyRunNamespace, stepID)
+	_, ok := sm.shadows.Load(key)
+	return ok
 }
 
 // SendOrBuffer tries to send a packet to a stream, or buffers it if the stream is not yet available.
@@ -335,26 +482,9 @@ func (sm *StreamManager) SendOrBufferWithOptions(ctx context.Context, storyRunNa
 	state := sm.ensureState(key, storyRunName, storyRunNamespace, stepID, opts.Flow, opts.Delivery, limits, opts.MaxInFlight)
 	packet = sm.assignEnvelope(state, packet, opts.Delivery)
 
-	// DEBUG: Log audio state in packet
-	hasAudio := packet.GetAudio() != nil
-	audioPcmLen := 0
-	if hasAudio {
-		audioPcmLen = len(packet.GetAudio().GetPcm())
-	}
-	sm.log.Info("SendOrBuffer called",
-		"key", key,
-		"storyRun", storyRunName,
-		"step", stepID,
-		"hasAudio", hasAudio,
-		"audioPcmLen", audioPcmLen)
-
 	if val, ok := sm.streams.Load(key); ok {
 		entry := val.(*streamEntry)
 		stream := entry.stream
-		sm.log.Info("Stream found, sending packet directly",
-			"key", key,
-			"hasAudio", hasAudio,
-			"audioPcmLen", audioPcmLen)
 
 		if bval, ok := sm.buffers.Load(key); ok {
 			if buffer, ok := bval.(*MessageBuffer); ok {
@@ -466,6 +596,7 @@ func (sm *StreamManager) ensureState(key, storyRunName, storyRunNamespace, stepI
 		storyRunNamespace: storyRunNamespace,
 		stepID:            stepID,
 		nextSequence:      1,
+		onHandoffChange:   sm.onHandoffChange,
 		handoff: handoffState{
 			phase:     handoffPhasePending,
 			updatedAt: time.Now(),
@@ -554,7 +685,14 @@ func (s *streamState) setHandoff(phase, reason string) {
 	s.handoff.phase = phase
 	s.handoff.reason = reason
 	s.handoff.updatedAt = time.Now()
+	cb := s.onHandoffChange
+	storyRunName := s.storyRunName
+	storyRunNamespace := s.storyRunNamespace
+	stepID := s.stepID
 	s.mu.Unlock()
+	if cb != nil {
+		go cb(storyRunName, storyRunNamespace, stepID, phase, reason)
+	}
 }
 
 func (s *streamState) setDrainPaused(paused bool) bool {

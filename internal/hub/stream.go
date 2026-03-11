@@ -18,6 +18,7 @@ package hub
 
 import (
 	"context"
+	"io"
 	"sync"
 
 	grpc_metrics "github.com/bubustack/bobravoz-grpc/pkg/metrics"
@@ -66,23 +67,6 @@ func (s *Stream) sendLoop() {
 				return
 			}
 
-			// DEBUG: Log audio state before gRPC Send
-			if req.resp != nil && req.resp.Packet != nil {
-				hasAudio := req.resp.Packet.GetAudio() != nil
-				audioPcmLen := 0
-				if hasAudio {
-					audioPcmLen = len(req.resp.Packet.GetAudio().GetPcm())
-				}
-				stepID := ""
-				if req.resp.Packet.Metadata != nil {
-					stepID = req.resp.Packet.Metadata["current-step-id"]
-				}
-				s.logger.Info("[STREAM_SEND] About to send via gRPC",
-					"step", stepID,
-					"hasAudio", hasAudio,
-					"audioPcmLen", audioPcmLen)
-			}
-
 			err := s.grpcStream.Send(req.resp)
 
 			if req.done != nil {
@@ -94,7 +78,8 @@ func (s *Stream) sendLoop() {
 			}
 			if err != nil {
 				s.logger.Error(err, "failed to send packet to stream")
-				return
+				// Keep the send loop alive so transient send errors don't stall future sends.
+				continue
 			}
 		}
 	}
@@ -102,15 +87,23 @@ func (s *Stream) sendLoop() {
 
 // Send sends a packet to the stream.
 func (s *Stream) Send(ctx context.Context, req *transportpb.DataPacket) error {
+	if ctx == nil {
+		s.logger.Info("Send called with nil context; cancellation signals will not propagate")
+		ctx = context.Background()
+	}
 	// Enqueue response for the single send loop; wait for completion or context cancel
 	sr := sendRequest{resp: &transportpb.ProcessResponse{Packet: req}, done: make(chan error, 1)}
 	select {
+	case <-s.done:
+		return io.ErrClosedPipe
 	case <-ctx.Done():
 		return ctx.Err()
 	case s.sendChan <- sr:
 		// enqueued
 	}
 	select {
+	case <-s.done:
+		return io.ErrClosedPipe
 	case <-ctx.Done():
 		return ctx.Err()
 	case err := <-sr.done:
@@ -124,6 +117,33 @@ func (s *Stream) Send(ctx context.Context, req *transportpb.DataPacket) error {
 				}
 			}
 		}
+		return err
+	}
+}
+
+// SendFlow sends a flow-control update to the stream.
+func (s *Stream) SendFlow(ctx context.Context, flow *transportpb.FlowControl) error {
+	if flow == nil {
+		return nil
+	}
+	if ctx == nil {
+		s.logger.Info("SendFlow called with nil context; cancellation signals will not propagate")
+		ctx = context.Background()
+	}
+	sr := sendRequest{resp: &transportpb.ProcessResponse{Flow: flow}, done: make(chan error, 1)}
+	select {
+	case <-s.done:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	case s.sendChan <- sr:
+	}
+	select {
+	case <-s.done:
+		return io.ErrClosedPipe
+	case <-ctx.Done():
+		return ctx.Err()
+	case err := <-sr.done:
 		return err
 	}
 }

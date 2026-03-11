@@ -16,11 +16,13 @@ data:
   hub.buffer-eviction-interval: "1m"
   hub.channel-buffer-size: "100"
   hub.per-message-timeout: "10m"
+  hub.max-active-streams: "2000"
+  hub.max-buffers: "1000"
+  hub.max-downstreams-hard-cap: "64"
   # Controls whether the connector + hub pipelines propagate OTEL trace context.
   telemetry.trace-propagation: "true"
   # CEL evaluator defaults for hub-side policy evaluation.
   templating.evaluation-timeout: "5s"
-  templating.max-expression-length: "4096"
   templating.max-output-bytes: "65536"
   templating.deterministic: "false"
   templating.offloaded-data-policy: "error"

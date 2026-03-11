@@ -95,7 +95,20 @@ func InstallCertManager() error {
 		"--namespace", "cert-manager",
 		"--timeout", "5m",
 	)
+	if _, err := Run(cmd); err != nil {
+		return err
+	}
 
+	// Wait for all cert-manager pods to be Ready. This ensures the cainjector has
+	// completed its initial sync and injected CA bundles into webhook configurations,
+	// preventing "x509: certificate signed by unknown authority" errors on the first
+	// API call that hits the cert-manager webhook.
+	cmd = exec.Command("kubectl", "wait", "pod",
+		"--for", "condition=Ready",
+		"--namespace", "cert-manager",
+		"--all",
+		"--timeout", "2m",
+	)
 	_, err := Run(cmd)
 	return err
 }

@@ -32,6 +32,23 @@
 
 - **Data Plane**: The operator runs an embedded gRPC `Hub Server`. When a `Story` is configured for hub mediation, the reconciler routes Engram traffic through the hub and injects lightweight connectors (from `ghcr.io/bubustack/bobravoz-connector`) alongside workloads, keeping the controller image lean.
 
+## 🧱 Backpressure Settings
+
+You can tune hub buffering per transport using `Story.spec.transports[].settings`. `Transport.spec.defaultSettings` act as defaults and are overridden by story-specific settings.
+
+```yaml
+spec:
+  transports:
+  - name: rt
+    transportRef: livekit-default
+    settings:
+      backpressure:
+        buffer:
+          maxMessages: 500
+          maxBytes: 10485760
+          dropPolicy: drop_oldest
+```
+
 ### 🧭 Connection Topologies
 
 Depending on your `Story` definition, `bobravoz-grpc` will create one of two connection types:

@@ -1083,6 +1083,9 @@ func (b *hubBridge) openHubStream(ctx context.Context) (*grpc.ClientConn, transp
 		metaCurrentStepID, b.cfg.StepID,
 		coretransport.ProtocolMetadataKey, coretransport.ProtocolVersion,
 	)
+	if b.cfg.Generation > 0 {
+		md.Append("connector-generation", strconv.FormatInt(int64(b.cfg.Generation), 10))
+	}
 	streamCtx, streamCancel := context.WithCancel(ctx)
 	processCtx := metadata.NewOutgoingContext(streamCtx, md)
 	client, err := transportpb.NewHubServiceClient(conn).Process(processCtx)
@@ -1706,26 +1709,7 @@ func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacke
 		Envelope:   cloneStreamEnvelope(packet.Envelope),
 	}
 
-	// CRITICAL DEBUG: Log exactly what's in the packet
-	hasAudio := packet.Audio != nil
-	hasVideo := packet.Video != nil
-	hasBinary := packet.Binary != nil
-	hasPayload := packet.Payload != nil
-	hasInputs := packet.Inputs != nil
-	audioPcmLen := 0
-	if hasAudio {
-		audioPcmLen = len(packet.Audio.Pcm)
-	}
-	logger.Info("[CONNECTOR_TRANSLATE] hubPacketToPublishRequest",
-		"hasAudio", hasAudio,
-		"audioPcmLen", audioPcmLen,
-		"hasVideo", hasVideo,
-		"hasBinary", hasBinary,
-		"hasPayload", hasPayload,
-		"hasInputs", hasInputs)
-
 	if audio := packet.GetAudio(); audio != nil {
-		logger.Info("[CONNECTOR_TRANSLATE] Returning AudioFrame", "pcmLen", len(audio.GetPcm()))
 		req.Frame = &transportpb.PublishRequest_Audio{
 			Audio: &transportpb.AudioFrame{
 				Pcm:          append([]byte(nil), audio.GetPcm()...),
@@ -1752,7 +1736,6 @@ func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacke
 		return req, nil
 	}
 
-	logger.Info("[CONNECTOR_TRANSLATE] No Audio/Video found, creating Envelope from Payload/Inputs")
 	env := &envelope.Envelope{
 		Metadata:   cloneStringMap(packet.Metadata),
 		Payload:    structToRawJSON(packet.Payload),
@@ -1761,10 +1744,8 @@ func hubPacketToPublishRequest(logger logr.Logger, packet *transportpb.DataPacke
 	}
 	extractEnvelopeHeaders(env)
 	if isEnvelopeEmpty(env) {
-		logger.Info("[CONNECTOR_TRANSLATE] Envelope is empty, returning nil")
 		return nil, nil
 	}
-	logger.Info("[CONNECTOR_TRANSLATE] Converting Envelope to BinaryFrame")
 	frame, err := envelope.ToBinaryFrame(env)
 	if err != nil {
 		return nil, err

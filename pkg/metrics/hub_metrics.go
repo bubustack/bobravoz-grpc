@@ -103,6 +103,52 @@ var (
 		},
 		[]string{"storyrun", "step"},
 	)
+
+	// hubEventTimeWatermarkGauge tracks the latest observed event-time watermark per stream.
+	hubEventTimeWatermarkGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "bobravoz_hub_event_time_watermark_seconds",
+			Help: "Latest observed event-time watermark (Unix seconds) per storyrun/step.",
+		},
+		[]string{"storyrun", "step"},
+	)
+
+	// hubEventTimeLagHistogram tracks the lag between event time and processing time.
+	hubEventTimeLagHistogram = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Name:    "bobravoz_hub_event_time_lag_seconds",
+			Help:    "Lag between event time and hub processing time in seconds.",
+			Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120, 300},
+		},
+		[]string{"storyrun", "step"},
+	)
+
+	// hubRecordingCounter tracks recording attempts and outcomes.
+	hubRecordingCounter = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "bobravoz_hub_stream_recordings_total",
+			Help: "Total number of stream recordings (by mode and outcome).",
+		},
+		[]string{"storyrun", "step", "mode", "status"},
+	)
+
+	// hubReplayLastAckGauge tracks the last acknowledged sequence per partition.
+	hubReplayLastAckGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "bobravoz_hub_replay_last_ack",
+			Help: "Last acknowledged sequence for replayable streams (per partition).",
+		},
+		[]string{"storyrun", "step", "partition"},
+	)
+
+	// hubReplayPendingGauge tracks the current number of unacked messages.
+	hubReplayPendingGauge = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "bobravoz_hub_replay_unacked_current",
+			Help: "Current number of unacked messages for replayable streams.",
+		},
+		[]string{"storyrun", "step"},
+	)
 )
 
 func init() {
@@ -117,6 +163,11 @@ func init() {
 		hubHeartbeatIntervalGauge,
 		hubHeartbeatFailureCounter,
 		hubHeartbeatsReceivedCounter,
+		hubEventTimeWatermarkGauge,
+		hubEventTimeLagHistogram,
+		hubRecordingCounter,
+		hubReplayLastAckGauge,
+		hubReplayPendingGauge,
 	)
 	// Initialize config gauges from environment (best-effort; defaults if unset)
 	// Keep logic independent from internal packages to avoid import cycles
@@ -180,6 +231,32 @@ func RecordHubHeartbeatInterval(interval time.Duration) {
 // RecordHubHeartbeatFailure increments the failure counter when SendHeartbeats fails.
 func RecordHubHeartbeatFailure() {
 	hubHeartbeatFailureCounter.Inc()
+}
+
+// RecordHubEventTime records event-time watermark and lag metrics.
+func RecordHubEventTime(storyRun, step string, eventTime time.Time, lag time.Duration) {
+	if !eventTime.IsZero() {
+		hubEventTimeWatermarkGauge.WithLabelValues(storyRun, step).Set(float64(eventTime.Unix()))
+	}
+	if lag < 0 {
+		lag = 0
+	}
+	hubEventTimeLagHistogram.WithLabelValues(storyRun, step).Observe(lag.Seconds())
+}
+
+// RecordHubRecording records stream recording outcomes.
+func RecordHubRecording(storyRun, step, mode, status string) {
+	hubRecordingCounter.WithLabelValues(storyRun, step, mode, status).Inc()
+}
+
+// RecordHubReplayLastAck records the last acknowledged sequence for a partition.
+func RecordHubReplayLastAck(storyRun, step, partition string, ack uint64) {
+	hubReplayLastAckGauge.WithLabelValues(storyRun, step, partition).Set(float64(ack))
+}
+
+// RecordHubReplayPending records the current number of unacked messages.
+func RecordHubReplayPending(storyRun, step string, pending int) {
+	hubReplayPendingGauge.WithLabelValues(storyRun, step).Set(float64(pending))
 }
 
 // Example HPA configuration for cluster admins:

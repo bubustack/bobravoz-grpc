@@ -34,3 +34,17 @@ func TestGetEvictionIntervalDefault(t *testing.T) {
 		t.Fatalf("expected default eviction interval 1m, got %s", interval)
 	}
 }
+
+func TestGetMaxDownstreamsHardCapFromEnv(t *testing.T) {
+	t.Setenv(contracts.HubMaxDownstreamsEnv, "128")
+	if cap := getMaxDownstreamsHardCap(); cap != 128 {
+		t.Fatalf("expected max downstreams hard cap 128, got %d", cap)
+	}
+}
+
+func TestGetMaxDownstreamsHardCapDefault(t *testing.T) {
+	t.Setenv(contracts.HubMaxDownstreamsEnv, "invalid")
+	if cap := getMaxDownstreamsHardCap(); cap != 64 {
+		t.Fatalf("expected default max downstreams hard cap 64, got %d", cap)
+	}
+}

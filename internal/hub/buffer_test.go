@@ -88,7 +88,44 @@ func TestMessageBuffer_Add_Overflow(t *testing.T) {
 	}
 }
 
-func TestMessageBuffer_Flush_Success(t *testing.T) {
+func TestMessageBuffer_Add_DropOldest(t *testing.T) {
+	buf := NewMessageBufferWithLimits("test-run", "test-step", bufferLimits{
+		maxMessages: 2,
+		maxBytes:    MaxBufferBytes,
+		dropPolicy:  bufferDropOldest,
+	})
+
+	msg1 := &transportpb.DataPacket{Metadata: map[string]string{"id": "1"}, Payload: &structpb.Struct{}}
+	msg2 := &transportpb.DataPacket{Metadata: map[string]string{"id": "2"}, Payload: &structpb.Struct{}}
+	msg3 := &transportpb.DataPacket{Metadata: map[string]string{"id": "3"}, Payload: &structpb.Struct{}}
+
+	if !buf.Add(msg1) || !buf.Add(msg2) {
+		t.Fatalf("expected initial adds to succeed")
+	}
+	if !buf.Add(msg3) {
+		t.Fatalf("expected drop_oldest to accept newest message")
+	}
+
+	var got []string
+	_, err := buf.FlushWithSender(context.Background(), func(p *transportpb.DataPacket) error {
+		got = append(got, p.Metadata["id"])
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected flush error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 messages flushed, got %d", len(got))
+	}
+	if got[0] != "2" || got[1] != "3" {
+		t.Fatalf("expected messages [2 3], got %v", got)
+	}
+	if buf.DroppedCount() != 1 {
+		t.Errorf("expected 1 dropped message, got %d", buf.DroppedCount())
+	}
+}
+
+func TestMessageBuffer_FlushWithSender_Success(t *testing.T) {
 	buf := NewMessageBuffer("test-run", "test-step")
 
 	// Add messages to buffer
@@ -99,26 +136,23 @@ func TestMessageBuffer_Flush_Success(t *testing.T) {
 		buf.Add(msg)
 	}
 
-	// Mock downstream stream
-	mockStream := &mockProcessServer{
-		sendFunc: func(packet *transportpb.DataPacket) error {
-			return nil // Success
-		},
-	}
-
 	ctx := context.Background()
-	flushed := buf.Flush(ctx, mockStream)
+	flushed, err := buf.FlushWithSender(ctx, func(pkt *transportpb.DataPacket) error {
+		return nil
+	})
 
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
 	if flushed != 3 {
 		t.Errorf("Expected 3 messages flushed, got %d", flushed)
 	}
-
 	if buf.Size() != 0 {
 		t.Errorf("Expected buffer empty after flush, got size %d", buf.Size())
 	}
 }
 
-func TestMessageBuffer_Flush_ContextCanceled(t *testing.T) {
+func TestMessageBuffer_FlushWithSender_ContextCanceled(t *testing.T) {
 	buf := NewMessageBuffer("test-run", "test-step")
 
 	// Add messages
@@ -131,15 +165,14 @@ func TestMessageBuffer_Flush_ContextCanceled(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	mockStream := &mockProcessServer{
-		sendFunc: func(packet *transportpb.DataPacket) error {
-			return nil
-		},
-	}
-
-	flushed := buf.Flush(ctx, mockStream)
+	flushed, err := buf.FlushWithSender(ctx, func(pkt *transportpb.DataPacket) error {
+		return nil
+	})
 
 	// Should not flush any messages (context canceled immediately)
+	if err == nil || err != context.Canceled {
+		t.Fatalf("Expected context.Canceled error, got %v", err)
+	}
 	if flushed != 0 {
 		t.Errorf("Expected 0 messages flushed (context canceled), got %d", flushed)
 	}

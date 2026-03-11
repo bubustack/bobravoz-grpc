@@ -61,6 +61,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - catalog.bubustack.io
+  resources:
+  - engramtemplates
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - runs.bubustack.io
   resources:
   - storyruns
@@ -88,6 +96,7 @@ rules:
   - transport.bubustack.io
   resources:
   - transportbindings
+  - transports
   verbs:
   - get
   - list

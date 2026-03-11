@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/bubustack/bobravoz-grpc/internal/connector"
 	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
@@ -22,7 +23,17 @@ func main() {
 	log.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 	logger := log.Log.WithName("connector")
 
-	telemetry.InitFromEnv()
+	if err := telemetry.InitFromEnv("bobravoz-connector"); err != nil {
+		logger.Error(err, "failed to initialize OTEL tracer provider")
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelShutdown()
+		if err := telemetry.Shutdown(shutdownCtx); err != nil {
+			logger.Error(err, "failed to shutdown OTEL tracer provider")
+		}
+	}()
 
 	cfg, err := connector.LoadConfigFromEnv()
 	if err != nil {

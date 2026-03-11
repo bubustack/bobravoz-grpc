@@ -24,10 +24,10 @@ var configManagerLog = ctrl.Log.WithName("operator-config").WithName("manager")
 
 // OperatorConfig represents the runtime configuration for the bobravoz-grpc controller.
 type OperatorConfig struct {
-	Hub       HubConfig       `json:"hub,omitempty"`
-	Telemetry TelemetryConfig `json:"telemetry,omitempty"`
+	Hub        HubConfig        `json:"hub,omitempty"`
+	Telemetry  TelemetryConfig  `json:"telemetry,omitempty"`
 	Templating TemplatingConfig `json:"templating,omitempty"`
-	Connector ConnectorConfig `json:"connector,omitempty"`
+	Connector  ConnectorConfig  `json:"connector,omitempty"`
 }
 
 // Clone returns a deep copy of the OperatorConfig.
@@ -47,13 +47,16 @@ type ConnectorConfig struct {
 
 // HubConfig captures hub-specific toggles.
 type HubConfig struct {
-	SecurityMode         string        `json:"securityMode,omitempty"`
-	BufferMaxMessages    int           `json:"bufferMaxMessages,omitempty"`
-	BufferMaxBytes       int           `json:"bufferMaxBytes,omitempty"`
-	BufferEvictionTTL    time.Duration `json:"bufferEvictionTTL,omitempty"`
-	BufferEvictionPeriod time.Duration `json:"bufferEvictionPeriod,omitempty"`
-	ChannelBufferSize    int           `json:"channelBufferSize,omitempty"`
-	PerMessageTimeout    time.Duration `json:"perMessageTimeout,omitempty"`
+	SecurityMode          string        `json:"securityMode,omitempty"`
+	BufferMaxMessages     int           `json:"bufferMaxMessages,omitempty"`
+	BufferMaxBytes        int           `json:"bufferMaxBytes,omitempty"`
+	BufferEvictionTTL     time.Duration `json:"bufferEvictionTTL,omitempty"`
+	BufferEvictionPeriod  time.Duration `json:"bufferEvictionPeriod,omitempty"`
+	ChannelBufferSize     int           `json:"channelBufferSize,omitempty"`
+	PerMessageTimeout     time.Duration `json:"perMessageTimeout,omitempty"`
+	MaxActiveStreams      int           `json:"maxActiveStreams,omitempty"`
+	MaxBuffers            int           `json:"maxBuffers,omitempty"`
+	MaxDownstreamsHardCap int           `json:"maxDownstreamsHardCap,omitempty"`
 }
 
 // TelemetryConfig captures OpenTelemetry-related toggles.
@@ -63,36 +66,37 @@ type TelemetryConfig struct {
 
 // TemplatingConfig captures template evaluation tunables for realtime routing.
 type TemplatingConfig struct {
-	EvaluationTimeout   time.Duration `json:"evaluationTimeout,omitempty"`
-	MaxExpressionLength int           `json:"maxExpressionLength,omitempty"`
-	MaxOutputBytes      int           `json:"maxOutputBytes,omitempty"`
-	Deterministic       bool          `json:"deterministic,omitempty"`
-	OffloadedPolicy     string        `json:"offloadedPolicy,omitempty"`
-	MaterializeEngram   string        `json:"materializeEngram,omitempty"`
+	EvaluationTimeout time.Duration `json:"evaluationTimeout,omitempty"`
+	MaxOutputBytes    int           `json:"maxOutputBytes,omitempty"`
+	Deterministic     bool          `json:"deterministic,omitempty"`
+	OffloadedPolicy   string        `json:"offloadedPolicy,omitempty"`
+	MaterializeEngram string        `json:"materializeEngram,omitempty"`
 }
 
 // DefaultOperatorConfig returns the default configuration used when the ConfigMap is absent.
 func DefaultOperatorConfig() *OperatorConfig {
 	return &OperatorConfig{
 		Hub: HubConfig{
-			SecurityMode:         contracts.TransportSecurityModePlaintext,
-			BufferMaxMessages:    1000,
-			BufferMaxBytes:       10 * 1024 * 1024,
-			BufferEvictionTTL:    10 * time.Minute,
-			BufferEvictionPeriod: time.Minute,
-			ChannelBufferSize:    100,
-			PerMessageTimeout:    10 * time.Minute,
+			SecurityMode:          contracts.TransportSecurityModePlaintext,
+			BufferMaxMessages:     1000,
+			BufferMaxBytes:        10 * 1024 * 1024,
+			BufferEvictionTTL:     10 * time.Minute,
+			BufferEvictionPeriod:  time.Minute,
+			ChannelBufferSize:     100,
+			PerMessageTimeout:     10 * time.Minute,
+			MaxActiveStreams:      2000,
+			MaxBuffers:            1000,
+			MaxDownstreamsHardCap: 64,
 		},
 		Telemetry: TelemetryConfig{
 			TracePropagation: true,
 		},
 		Templating: TemplatingConfig{
-			EvaluationTimeout:   30 * time.Second,
-			MaxExpressionLength: 1000,
-			MaxOutputBytes:      64 * 1024,
-			Deterministic:       false,
-			OffloadedPolicy:     "error",
-			MaterializeEngram:   "bubu-materialize",
+			EvaluationTimeout: 30 * time.Second,
+			MaxOutputBytes:    64 * 1024,
+			Deterministic:     false,
+			OffloadedPolicy:   "error",
+			MaterializeEngram: "bubu-materialize",
 		},
 		Connector: ConnectorConfig{
 			Image:           DefaultConnectorImage,
@@ -167,14 +171,6 @@ func parseOperatorConfigMap(cm *corev1.ConfigMap) *OperatorConfig {
 		if mode := normalizeSecurityModeValue(val); mode != "" {
 			cfg.Hub.SecurityMode = mode
 		}
-	} else if val, ok := cm.Data["hub.allow-insecure"]; ok {
-		if parsed, err := strconv.ParseBool(val); err == nil {
-			if parsed {
-				cfg.Hub.SecurityMode = contracts.TransportSecurityModePlaintext
-			} else {
-				cfg.Hub.SecurityMode = contracts.TransportSecurityModeTLS
-			}
-		}
 	}
 	if val, ok := cm.Data["hub.buffer-max-messages"]; ok {
 		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
@@ -206,6 +202,21 @@ func parseOperatorConfigMap(cm *corev1.ConfigMap) *OperatorConfig {
 			cfg.Hub.PerMessageTimeout = parsed
 		}
 	}
+	if val, ok := cm.Data["hub.max-active-streams"]; ok {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			cfg.Hub.MaxActiveStreams = parsed
+		}
+	}
+	if val, ok := cm.Data["hub.max-buffers"]; ok {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			cfg.Hub.MaxBuffers = parsed
+		}
+	}
+	if val, ok := cm.Data["hub.max-downstreams-hard-cap"]; ok {
+		if parsed, err := strconv.Atoi(val); err == nil && parsed > 0 {
+			cfg.Hub.MaxDownstreamsHardCap = parsed
+		}
+	}
 	if val, ok := cm.Data["telemetry.trace-propagation"]; ok {
 		if parsed, err := strconv.ParseBool(val); err == nil {
 			cfg.Telemetry.TracePropagation = parsed
@@ -225,11 +236,6 @@ func parseTemplatingConfig(cm *corev1.ConfigMap, cfg *OperatorConfig) {
 	if val, ok := cm.Data[contracts.KeyTemplatingEvaluationTimeout]; ok {
 		if parsed, err := time.ParseDuration(val); err == nil && parsed >= 0 {
 			cfg.Templating.EvaluationTimeout = parsed
-		}
-	}
-	if val, ok := cm.Data[contracts.KeyTemplatingMaxExpressionLength]; ok {
-		if parsed, err := strconv.Atoi(val); err == nil && parsed >= 0 {
-			cfg.Templating.MaxExpressionLength = parsed
 		}
 	}
 	if val, ok := cm.Data[contracts.KeyTemplatingMaxOutputBytes]; ok {

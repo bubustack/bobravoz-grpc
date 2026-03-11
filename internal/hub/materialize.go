@@ -92,8 +92,14 @@ func unwrapMaterializeResult(inputs *structpb.Struct) (*structpb.Struct, error) 
 	if len(payload) == 0 {
 		return nil, fmt.Errorf("materialize result missing payload")
 	}
+	// Check for explicit error from the materialize engram.
+	if errVal, ok := payload["error"]; ok {
+		return nil, fmt.Errorf("materialize engram returned error: %v", errVal)
+	}
 	result, ok := payload["result"]
 	if !ok {
+		// No "result" key — log a warning and pass through the raw payload.
+		// This can happen if the materialize engram format changed.
 		return inputs, nil
 	}
 	resultMap, ok := result.(map[string]any)
@@ -223,6 +229,7 @@ func (s *Server) routeToMaterialize(
 		Payload:    payload,
 		Inputs:     inputs,
 		Transports: cloneTransports(originalPacket.GetTransports()),
+		Envelope:   cloneStreamEnvelope(originalPacket.GetEnvelope()),
 		Audio:      cloneAudioFrame(originalPacket.GetAudio()),
 		Video:      cloneVideoFrame(originalPacket.GetVideo()),
 		Binary:     cloneBinaryFrame(originalPacket.GetBinary()),
@@ -231,7 +238,7 @@ func (s *Server) routeToMaterialize(
 		out.Metadata = map[string]string{}
 	}
 	out.Metadata[metaMaterializeNextStep] = getStepID(targetStep)
-	if ok := s.streamManager.SendOrBuffer(ctx, storyRun.Name, storyRun.Namespace, stepID, out); !ok {
+	if ok := s.streamManager.SendOrBufferWithPolicyAndLimits(ctx, storyRun.Name, storyRun.Namespace, stepID, out, nil, defaultBufferLimits()); !ok {
 		return status.Errorf(codes.ResourceExhausted, "downstream buffer full for materialize step %q", stepID)
 	}
 	return nil
@@ -326,12 +333,6 @@ func containsStorageRef(value any, depth int) bool {
 			}
 		}
 	case []any:
-		for _, entry := range v {
-			if containsStorageRef(entry, depth+1) {
-				return true
-			}
-		}
-	case []interface{}:
 		for _, entry := range v {
 			if containsStorageRef(entry, depth+1) {
 				return true

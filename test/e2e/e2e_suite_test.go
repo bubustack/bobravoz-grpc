@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -32,6 +33,13 @@ import (
 )
 
 var (
+	// managerImage is the manager image to be built and loaded for testing.
+	managerImage = "example.com/bobravoz-grpc:v0.0.1"
+	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
+	shouldCleanupCertManager = false
+	// shouldCleanupSharedCA tracks whether the shared CA resources were installed by this suite.
+	shouldCleanupSharedCA = false
+
 	// Optional Environment Variables:
 	// - CERT_MANAGER_INSTALL_SKIP=true: Skips CertManager installation during test setup.
 	// These variables are useful if CertManager is already installed, avoiding
@@ -44,6 +52,9 @@ var (
 	// with the code source changes to be tested.
 	projectImage = "bobravoz-grpc:latest"
 )
+
+const sharedCAManifestPath = "config/certmanager/shared-ca.yaml"
+const sharedCAIssuerName = "bobrapet-shared-ca"
 
 // TestE2E runs the e2e test suite to validate the solution in an isolated environment.
 // The default setup requires Kind and CertManager.
@@ -68,9 +79,11 @@ var _ = BeforeSuite(func() {
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
 
 	setupCertManager()
+	setupSharedCA()
 })
 
 var _ = AfterSuite(func() {
+	teardownSharedCA()
 	teardownCertManager()
 })
 
@@ -105,4 +118,39 @@ func teardownCertManager() {
 
 	By("uninstalling CertManager")
 	utils.UninstallCertManager()
+}
+
+// setupSharedCA ensures the shared CA resources exist for webhook/metrics certs.
+// If not present, it applies the shared CA manifest and marks it for cleanup.
+func setupSharedCA() {
+	By("checking if shared CA is already installed")
+	cmd := exec.Command("kubectl", "get", "clusterissuer", sharedCAIssuerName)
+	output, err := utils.Run(cmd)
+	if err != nil {
+		if !strings.Contains(output, "NotFound") && !strings.Contains(output, "not found") {
+			ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to check shared CA")
+		}
+
+		By("installing shared CA for tests")
+		cmd = exec.Command("kubectl", "apply", "-f", sharedCAManifestPath)
+		_, err = utils.Run(cmd)
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to install shared CA")
+		shouldCleanupSharedCA = true
+		return
+	}
+
+	if strings.TrimSpace(output) != "" {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Shared CA is already installed. Skipping installation.\n")
+	}
+}
+
+// teardownSharedCA removes shared CA resources if they were installed by setupSharedCA.
+func teardownSharedCA() {
+	if !shouldCleanupSharedCA {
+		return
+	}
+
+	By("uninstalling shared CA installed by this suite")
+	cmd := exec.Command("kubectl", "delete", "-f", sharedCAManifestPath)
+	_, _ = utils.Run(cmd)
 }

@@ -17,6 +17,9 @@ func TestOperatorConfigParseHubTunables(t *testing.T) {
 			"hub.buffer-eviction-interval": "30s",
 			"hub.channel-buffer-size":      "55",
 			"hub.per-message-timeout":      "90s",
+			"hub.max-active-streams":       "250",
+			"hub.max-buffers":              "400",
+			"hub.max-downstreams-hard-cap": "16",
 		},
 	}
 
@@ -39,6 +42,15 @@ func TestOperatorConfigParseHubTunables(t *testing.T) {
 	if cfg.Hub.PerMessageTimeout != 90*time.Second {
 		t.Fatalf("expected per message timeout to be 90s, got %s", cfg.Hub.PerMessageTimeout)
 	}
+	if cfg.Hub.MaxActiveStreams != 250 {
+		t.Fatalf("expected max active streams to be 250, got %d", cfg.Hub.MaxActiveStreams)
+	}
+	if cfg.Hub.MaxBuffers != 400 {
+		t.Fatalf("expected max buffers to be 400, got %d", cfg.Hub.MaxBuffers)
+	}
+	if cfg.Hub.MaxDownstreamsHardCap != 16 {
+		t.Fatalf("expected max downstreams hard cap to be 16, got %d", cfg.Hub.MaxDownstreamsHardCap)
+	}
 }
 
 func TestOperatorConfigSecurityModeParsing(t *testing.T) {
@@ -52,25 +64,6 @@ func TestOperatorConfigSecurityModeParsing(t *testing.T) {
 		t.Fatalf("expected security mode tls, got %s", cfg.Hub.SecurityMode)
 	}
 
-	cm = &corev1.ConfigMap{
-		Data: map[string]string{
-			"hub.allow-insecure": "false",
-		},
-	}
-	cfg = parseOperatorConfigMap(cm)
-	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
-		t.Fatalf("expected deprecated allow-insecure=false to map to tls, got %s", cfg.Hub.SecurityMode)
-	}
-
-	cm = &corev1.ConfigMap{
-		Data: map[string]string{
-			"hub.allow-insecure": "true",
-		},
-	}
-	cfg = parseOperatorConfigMap(cm)
-	if cfg.Hub.SecurityMode != contracts.TransportSecurityModePlaintext {
-		t.Fatalf("expected deprecated allow-insecure=true to map to plaintext, got %s", cfg.Hub.SecurityMode)
-	}
 }
 
 func TestOperatorConfigConnectorFields(t *testing.T) {

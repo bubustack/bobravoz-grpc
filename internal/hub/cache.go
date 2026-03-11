@@ -67,15 +67,20 @@ func (c *storyCache) Get(ctx context.Context, storyRunName, storyRunNS string) (
 	}
 	c.mu.Unlock()
 
+	// Use a short timeout to avoid blocking processPacket when an Informer
+	// hasn't synced yet (same issue as Transport Informer — see backpressure.go).
+	getCtx, getCancel := context.WithTimeout(ctx, 2*time.Second)
+	defer getCancel()
+
 	// Fetch from API server
 	var storyRun runsv1alpha1.StoryRun
-	if err := c.client.Get(ctx, k8stypes.NamespacedName{Name: storyRunName, Namespace: storyRunNS}, &storyRun); err != nil {
+	if err := c.client.Get(getCtx, k8stypes.NamespacedName{Name: storyRunName, Namespace: storyRunNS}, &storyRun); err != nil {
 		return nil, nil, err
 	}
 
 	storyNamespace := refs.ResolveNamespace(&storyRun, &storyRun.Spec.StoryRef.ObjectReference)
 	var story bubuv1alpha1.Story
-	if err := c.client.Get(ctx, k8stypes.NamespacedName{Name: storyRun.Spec.StoryRef.Name, Namespace: storyNamespace}, &story); err != nil {
+	if err := c.client.Get(getCtx, k8stypes.NamespacedName{Name: storyRun.Spec.StoryRef.Name, Namespace: storyNamespace}, &story); err != nil {
 		return nil, nil, err
 	}
 

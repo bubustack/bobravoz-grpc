@@ -28,10 +28,14 @@ import (
 	"testing"
 	"time"
 
+	catalogv1alpha1 "github.com/bubustack/bobrapet/api/catalog/v1alpha1"
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
+	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
 	"github.com/bubustack/bobrapet/pkg/enums"
 	"github.com/bubustack/bobrapet/pkg/refs"
+	"github.com/bubustack/core/contracts"
+	coretransport "github.com/bubustack/core/runtime/transport"
 	"github.com/bubustack/core/templating"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
 	"github.com/stretchr/testify/assert"
@@ -121,6 +125,8 @@ func newTestServer(t *testing.T, objects ...client.Object) *Server {
 
 func newTestServerWithConfig(t *testing.T, offloadedPolicy, materializeEngram string, objects ...client.Object) *Server {
 	t.Helper()
+	// Ensure hub tests never attempt to initialize external storage backends.
+	t.Setenv(contracts.StorageProviderEnv, "none")
 	scheme := runtime.NewScheme()
 	// Add types to scheme
 	if err := runsv1alpha1.AddToScheme(scheme); err != nil {
@@ -129,7 +135,43 @@ func newTestServerWithConfig(t *testing.T, offloadedPolicy, materializeEngram st
 	if err := bubuv1alpha1.AddToScheme(scheme); err != nil {
 		panic(err)
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+	if err := catalogv1alpha1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	if err := transportv1alpha1.AddToScheme(scheme); err != nil {
+		panic(err)
+	}
+	defaultTemplateName := "tmpl"
+	providedTemplates := map[string]struct{}{}
+	for _, obj := range objects {
+		if template, ok := obj.(*catalogv1alpha1.EngramTemplate); ok {
+			if template != nil && template.Name != "" {
+				providedTemplates[template.Name] = struct{}{}
+			}
+		}
+	}
+	requiredTemplates := map[string]struct{}{}
+	for _, obj := range objects {
+		engram, ok := obj.(*bubuv1alpha1.Engram)
+		if !ok || engram == nil {
+			continue
+		}
+		templateName := strings.TrimSpace(engram.Spec.TemplateRef.Name)
+		if templateName == "" {
+			templateName = defaultTemplateName
+			engram.Spec.TemplateRef.Name = templateName
+		}
+		requiredTemplates[templateName] = struct{}{}
+	}
+	for templateName := range requiredTemplates {
+		if _, ok := providedTemplates[templateName]; ok {
+			continue
+		}
+		objects = append(objects, &catalogv1alpha1.EngramTemplate{
+			ObjectMeta: metav1.ObjectMeta{Name: templateName},
+		})
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).WithStatusSubresource(&runsv1alpha1.StepRun{}, &runsv1alpha1.StoryRun{}).Build()
 	server, err := NewServer(context.Background(), fakeClient, templating.Config{}, offloadedPolicy, materializeEngram)
 	if err != nil {
 		// In tests, we expect server creation to always succeed.
@@ -137,6 +179,871 @@ func newTestServerWithConfig(t *testing.T, offloadedPolicy, materializeEngram st
 	}
 	t.Cleanup(server.Close)
 	return server
+}
+
+func rawExtensionFromMap(t *testing.T, data map[string]any) *runtime.RawExtension {
+	t.Helper()
+	b, err := json.Marshal(data)
+	require.NoError(t, err)
+	return &runtime.RawExtension{Raw: b}
+}
+
+func TestEvaluateStepCondition_StaticFalse(t *testing.T) {
+	s := newTestServer(t)
+	expr := "{{ eq inputs.flag true }}"
+	payload, err := structpb.NewStruct(map[string]any{"kind": "x"})
+	require.NoError(t, err)
+
+	ok, deferred, err := s.evaluateStepCondition(context.Background(), &expr, payload, nil, map[string]any{"flag": false}, false)
+	require.NoError(t, err)
+	assert.False(t, deferred)
+	assert.False(t, ok)
+}
+
+func TestEvaluateStepCondition_RuntimePacket(t *testing.T) {
+	s := newTestServer(t)
+	expr := "{{ eq packet.kind \"x\" }}"
+	payload, err := structpb.NewStruct(map[string]any{"kind": "x"})
+	require.NoError(t, err)
+
+	ok, deferred, err := s.evaluateStepCondition(context.Background(), &expr, payload, nil, nil, false)
+	require.NoError(t, err)
+	assert.False(t, deferred)
+	assert.True(t, ok)
+}
+
+func TestEvaluateStepCondition_RuntimeIndexStepsMissingDoesNotFail(t *testing.T) {
+	s := newTestServer(t)
+	expr := "{{ eq (default false (index .steps \"context-user\").accepted) true }}"
+
+	ok, deferred, err := s.evaluateStepCondition(context.Background(), &expr, nil, nil, nil, false)
+	require.NoError(t, err)
+	assert.False(t, deferred)
+	assert.False(t, ok)
+}
+
+func TestEvaluateEngramInputs_RuntimeIndexStepsMissingDoesNotFail(t *testing.T) {
+	s := newTestServer(t)
+	story := &bubuv1alpha1.Story{
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.StreamingPattern,
+		},
+	}
+	step := &bubuv1alpha1.Step{
+		Name: "respond",
+		Runtime: rawExtensionFromMap(t, map[string]any{
+			"userPrompt": "{{ default \"\" (index .steps \"context-user\").text }}",
+		}),
+	}
+
+	out, err := s.evaluateEngramInputs(context.Background(), story, step, nil, nil, nil)
+	require.NoError(t, err)
+	require.NotNil(t, out)
+	assert.Equal(t, "", out.AsMap()["userPrompt"])
+}
+
+func TestLifecycleHookConsumerStepIndexes(t *testing.T) {
+	readyExpr := "{{ eq (default \"\" packet.type) \"storyrun.ready\" }}"
+	otherExpr := "{{ eq (default \"\" packet.type) \"speech.transcript.v1\" }}"
+	story := &bubuv1alpha1.Story{
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "ingress",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "livekit-voice-stream"}},
+				},
+				{
+					Name: "greet",
+					If:   &readyExpr,
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "openai-assistant"}},
+				},
+				{
+					Name: "respond",
+					If:   &otherExpr,
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "openai-assistant"}},
+				},
+			},
+		},
+	}
+
+	consumers := lifecycleHookConsumerStepIndexes(story, lifecycleHookStoryReadyEvent)
+	require.Equal(t, []int{1}, consumers)
+}
+
+func TestAllStreamingStepStreamsConnected(t *testing.T) {
+	s := newTestServer(t)
+	story := &bubuv1alpha1.Story{
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name:      "ingress",
+					Transport: "voice",
+					Ref:       &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "livekit-voice-stream"}},
+				},
+				{
+					Name:      "transcribe",
+					Transport: "voice",
+					Ref:       &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "openai-stt"}},
+				},
+				{
+					Name: "fanout",
+					Type: enums.StepTypeParallel,
+				},
+			},
+		},
+	}
+
+	storyRunName := "storyrun"
+	storyRunNS := "ns"
+	require.False(t, s.allStreamingStepStreamsConnected(story, storyRunName, storyRunNS))
+
+	keyIngress := s.streamManager.streamKey(storyRunName, storyRunNS, "ingress")
+	s.streamManager.streams.Store(keyIngress, &streamEntry{})
+	require.False(t, s.allStreamingStepStreamsConnected(story, storyRunName, storyRunNS))
+
+	keyTranscribe := s.streamManager.streamKey(storyRunName, storyRunNS, "transcribe")
+	s.streamManager.streams.Store(keyTranscribe, &streamEntry{})
+	require.True(t, s.allStreamingStepStreamsConnected(story, storyRunName, storyRunNS))
+}
+
+func TestEmitLifecycleHookEvent_BuffersHookPacketForConsumerStep(t *testing.T) {
+	ns := "ns"
+	hookExpr := "{{ eq (default \"\" packet.type) \"storyrun.ready\" }}"
+
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name:      "ingress",
+					Transport: "voice",
+					Ref:       &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "livekit-voice-stream"}},
+				},
+				{
+					Name:      "greet",
+					Needs:     []string{"ingress"},
+					Transport: "voice",
+					If:        &hookExpr,
+					Ref:       &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "openai-assistant"}},
+					Runtime:   rawExtensionFromMap(t, map[string]any{"userPrompt": "say hi"}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+			Inputs:   rawExtensionFromMap(t, map[string]any{"participant": map[string]any{"identity": "alice"}}),
+		},
+	}
+	engramGreet := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "openai-assistant", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+
+	s := newTestServer(t, story, storyRun, engramGreet)
+	consumerIdx := lifecycleHookConsumerStepIndexes(story, lifecycleHookStoryReadyEvent)
+	require.Equal(t, []int{1}, consumerIdx)
+	payload, err := lifecycleHookPayload(lifecycleHookStoryReadyEvent, storyRun.Name, storyRun.Namespace, "ingress")
+	require.NoError(t, err)
+	storyInputs, err := rawExtensionToMap(storyRun.Spec.Inputs)
+	require.NoError(t, err)
+	shouldRun, deferred, err := s.evaluateStepCondition(context.Background(), story.Spec.Steps[1].If, payload, nil, storyInputs, false)
+	require.NoError(t, err)
+	require.False(t, deferred)
+	require.True(t, shouldRun)
+	evaluatedInputs, deferred, err := s.evaluateNextEngramInputs(context.Background(), storyRun.Name, story, &story.Spec.Steps[1], payload, nil, storyInputs)
+	require.NoError(t, err)
+	require.False(t, deferred)
+	require.NotNil(t, evaluatedInputs)
+	assert.Equal(t, "say hi", evaluatedInputs.AsMap()["userPrompt"])
+
+	sent := s.emitLifecycleHookEvent(context.Background(), storyRun, story, lifecycleHookStoryReadyEvent, "ingress")
+	require.True(t, sent)
+
+	keyGreet := s.streamManager.streamKey(storyRun.Name, ns, "greet")
+	val, ok := s.streamManager.buffers.Load(keyGreet)
+	require.True(t, ok)
+	buf := val.(*MessageBuffer)
+	require.Greater(t, buf.Size(), 0)
+
+	buf.mu.Lock()
+	require.NotEmpty(t, buf.messages)
+	packet := buf.messages[0]
+	buf.mu.Unlock()
+
+	require.NotNil(t, packet.GetPayload())
+	assert.Equal(t, lifecycleHookStoryReadyEvent, packet.GetPayload().AsMap()["type"])
+	require.NotNil(t, packet.GetInputs())
+	assert.Equal(t, "say hi", packet.GetInputs().AsMap()["userPrompt"])
+}
+
+func TestProcessPacket_SkipConditionRoutesToNextEngram(t *testing.T) {
+	ns := "ns"
+	ifFalse := "{{ eq inputs.route \"b\" }}"
+
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					If:    &ifFalse,
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+			Inputs:   rawExtensionFromMap(t, map[string]any{"route": "c"}),
+		},
+	}
+
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+
+	s := newTestServer(t, story, storyRun, engramB, engramC)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, okB := s.streamManager.buffers.Load(keyB)
+	assert.False(t, okB)
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	val, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	buf := val.(*MessageBuffer)
+	assert.Greater(t, buf.Size(), 0)
+}
+
+func TestProcessPacket_HeartbeatSkipsStaticFalse(t *testing.T) {
+	ns := "ns"
+	ifFalse := "{{ eq inputs.route \"b\" }}"
+
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					If:    &ifFalse,
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+			Inputs:   rawExtensionFromMap(t, map[string]any{"route": "c"}),
+		},
+	}
+
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+
+	s := newTestServer(t, story, storyRun, engramB, engramC)
+	packet := &transportpb.DataPacket{Metadata: map[string]string{"bubu-heartbeat": trueString}}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, okB := s.streamManager.buffers.Load(keyB)
+	assert.False(t, okB)
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	val, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	buf := val.(*MessageBuffer)
+	assert.Greater(t, buf.Size(), 0)
+}
+
+func TestProcessPacket_ParallelFanOut(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-parallel",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeParallel,
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB, engramC)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	valB, okB := s.streamManager.buffers.Load(keyB)
+	require.True(t, okB)
+	assert.Greater(t, valB.(*MessageBuffer).Size(), 0)
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	valC, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	assert.Greater(t, valC.(*MessageBuffer).Size(), 0)
+}
+
+func TestProcessPacket_BroadcastToMultipleEngrams(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB, engramC)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	valB, okB := s.streamManager.buffers.Load(keyB)
+	require.True(t, okB)
+	assert.Greater(t, valB.(*MessageBuffer).Size(), 0)
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	valC, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	assert.Greater(t, valC.(*MessageBuffer).Size(), 0)
+}
+
+func TestProcessPacket_RuntimeIfSkipsBranch(t *testing.T) {
+	ns := "ns"
+	ifExpr := "{{ eq packet.kind \"x\" }}"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					If:    &ifExpr,
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB, engramC)
+	payload, err := structpb.NewStruct(map[string]any{"kind": "y"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, okB := s.streamManager.buffers.Load(keyB)
+	assert.False(t, okB)
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	valC, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	assert.Greater(t, valC.(*MessageBuffer).Size(), 0)
+}
+
+func TestProcessPacket_JoinWaitsForAllNeeds(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-b"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+				{
+					Name:  "step-c",
+					Needs: []string{"step-a", "step-b"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-c"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramC := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-c", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramC)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+
+	packetA := &transportpb.DataPacket{Payload: payload, Metadata: map[string]string{metaJoinKey: "join-1"}}
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packetA))
+
+	keyC := s.streamManager.streamKey(storyRun.Name, ns, "step-c")
+	_, okC := s.streamManager.buffers.Load(keyC)
+	assert.False(t, okC)
+
+	packetB := &transportpb.DataPacket{Payload: payload, Metadata: map[string]string{metaJoinKey: "join-1"}}
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-b", packetB))
+
+	valC, okC := s.streamManager.buffers.Load(keyC)
+	require.True(t, okC)
+	assert.Greater(t, valC.(*MessageBuffer).Size(), 0)
+}
+
+func TestProcessPacket_StopPrimitive(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-stop",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeStop,
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, okB := s.streamManager.buffers.Load(keyB)
+	assert.False(t, okB)
+}
+
+func TestProcessPacket_ExecuteStoryCreatesChild(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-exec",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeExecuteStory,
+					With: rawExtensionFromMap(t, map[string]any{
+						"storyRef": map[string]any{"name": "child-story"},
+						"with":     map[string]any{"key": "value"},
+					}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	s := newTestServer(t, story, storyRun)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	var list runsv1alpha1.StoryRunList
+	err = s.client.List(context.Background(), &list, client.InNamespace(ns), client.MatchingLabels{
+		contracts.ParentStoryRunLabel: storyRun.Name,
+		contracts.ParentStepLabel:     "step-exec",
+	})
+	require.NoError(t, err)
+	assert.Len(t, list.Items, 1)
+}
+
+func TestProcessPacket_PrimitiveAfterParallelExecutes(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.StreamingPattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-parallel",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeParallel,
+				},
+				{
+					Name:  "step-exec",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeExecuteStory,
+					With: rawExtensionFromMap(t, map[string]any{
+						"storyRef": map[string]any{"name": "child-story"},
+						"with":     map[string]any{"key": "value"},
+					}),
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	var list runsv1alpha1.StoryRunList
+	err = s.client.List(context.Background(), &list, client.InNamespace(ns), client.MatchingLabels{
+		contracts.ParentStoryRunLabel: storyRun.Name,
+		contracts.ParentStepLabel:     "step-exec",
+	})
+	require.NoError(t, err)
+	assert.Len(t, list.Items, 1)
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, okB := s.streamManager.buffers.Load(keyB)
+	assert.True(t, okB)
+}
+
+func TestProcessPacket_StreamingWithValidationBlocksStepsContext(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.StreamingPattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+					With: rawExtensionFromMap(t, map[string]any{
+						"foo": "{{ steps.step-a.outputs.value }}",
+					}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	s := newTestServer(t, story, storyRun)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	err = s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "with block not valid for streaming")
+}
+
+func TestStreamingTemplateScopes(t *testing.T) {
+	staticScope := streamingStaticScope()
+	runtimeScope := streamingRuntimeScope()
+
+	err := templating.ValidateTemplateString("{{ packet.id }}", staticScope)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "packet")
+
+	err = templating.ValidateTemplateString("{{ steps.alpha.value }}", staticScope)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "steps")
+
+	err = templating.ValidateTemplateString("{{ now }}", staticScope)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "now")
+
+	err = templating.ValidateTemplateString("{{ packet.id }}", runtimeScope)
+	require.NoError(t, err)
+
+	err = templating.ValidateTemplateString("{{ steps.alpha.value }}", runtimeScope)
+	require.NoError(t, err)
+
+	err = templating.ValidateTemplateString("{{ inputs.flag }}", runtimeScope)
+	require.NoError(t, err)
+}
+
+func TestProcessPacket_ExecuteStoryWaitsForCompletion(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-exec",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeExecuteStory,
+					With: rawExtensionFromMap(t, map[string]any{
+						"storyRef":          map[string]any{"name": "child-story"},
+						"waitForCompletion": true,
+						"with":              map[string]any{"key": "value"},
+					}),
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-exec"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, engramB)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- s.processPacket(ctx, storyRun.Name, ns, "step-a", packet)
+	}()
+
+	var child runsv1alpha1.StoryRun
+	require.Eventually(t, func() bool {
+		var list runsv1alpha1.StoryRunList
+		if err := s.client.List(context.Background(), &list, client.InNamespace(ns), client.MatchingLabels{
+			contracts.ParentStoryRunLabel: storyRun.Name,
+			contracts.ParentStepLabel:     "step-exec",
+		}); err != nil {
+			return false
+		}
+		if len(list.Items) != 1 {
+			return false
+		}
+		child = list.Items[0]
+		return true
+	}, time.Second, 20*time.Millisecond)
+
+	select {
+	case err := <-done:
+		t.Fatalf("process returned early: %v", err)
+	case <-time.After(75 * time.Millisecond):
+	}
+
+	child.Status.Phase = enums.PhaseSucceeded
+	child.Status.Message = "ok"
+	require.NoError(t, s.client.Status().Update(context.Background(), &child))
+
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatalf("process did not return after child completion")
+	}
+}
+
+func TestEvaluateStepCondition_HeartbeatIgnoresRuntime(t *testing.T) {
+	s := newTestServer(t)
+	expr := "{{ eq packet.kind \"x\" }}"
+
+	ok, deferred, err := s.evaluateStepCondition(context.Background(), &expr, nil, nil, nil, true)
+	require.NoError(t, err)
+	assert.False(t, deferred)
+	assert.True(t, ok)
+}
+
+func TestEvaluateStepCondition_RuntimeInvalidContext(t *testing.T) {
+	s := newTestServer(t)
+	expr := "{{ trigger.foo }}"
+
+	ok, deferred, err := s.evaluateStepCondition(context.Background(), &expr, nil, nil, nil, false)
+	require.Error(t, err)
+	assert.False(t, deferred)
+	assert.False(t, ok)
+	assert.Contains(t, err.Error(), "unsupported context 'trigger'")
 }
 
 func TestServer_Process_MissingMetadata(t *testing.T) {
@@ -154,9 +1061,10 @@ func TestServer_Process_MissingMetadata(t *testing.T) {
 func TestServer_Process_StreamEOF(t *testing.T) {
 	s := newTestServer(t)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 	stream := newMockStream(ctx)
@@ -172,9 +1080,10 @@ func TestServer_Process_StreamEOF(t *testing.T) {
 func TestServer_Process_ContextCanceled(t *testing.T) {
 	s := newTestServer(t)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	ctx = metadata.NewIncomingContext(ctx, md)
@@ -196,9 +1105,10 @@ func TestServer_Process_ContextCanceled(t *testing.T) {
 func TestServer_Process_RecvError(t *testing.T) {
 	s := newTestServer(t)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 	stream := newMockStream(ctx)
@@ -307,9 +1217,10 @@ func TestServer_Process_PerMessageTimeout(t *testing.T) {
 	s.perMessageTimeout = 15 * time.Millisecond
 
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 	stream := newMockStream(ctx)
@@ -398,9 +1309,10 @@ func TestServer_Process_ForwardMessage(t *testing.T) {
 
 	s := newTestServer(t, story, storyRun, engram1, engram2)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
@@ -474,6 +1386,25 @@ func TestServer_Process_BatchStepReceivesEvaluatedInputs(t *testing.T) {
 
 	s := newTestServer(t, story, storyRun, engram)
 
+	// Background goroutine: once the batch StepRun is created, mark it as Succeeded
+	// so the hub's wait-for-completion loop can proceed.
+	go func() {
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		for range ticker.C {
+			var list runsv1alpha1.StepRunList
+			if err := s.client.List(context.Background(), &list, client.InNamespace("test-ns")); err != nil || len(list.Items) == 0 {
+				continue
+			}
+			sr := &list.Items[0]
+			original := sr.DeepCopy()
+			sr.Status.Phase = enums.PhaseSucceeded
+			sr.Status.Output = &runtime.RawExtension{Raw: []byte(`{"result":"ok"}`)}
+			_ = s.client.Status().Patch(context.Background(), sr, client.MergeFrom(original))
+			return
+		}
+	}()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	payload, _ := structpb.NewStruct(map[string]any{"url": "https://example.com"})
@@ -522,9 +1453,10 @@ func TestServer_Process_CELPrimitive(t *testing.T) {
 
 	s := newTestServer(t, story, storyRun, engram1, engram2)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
@@ -555,8 +1487,8 @@ func TestServer_Process_CELPrimitive(t *testing.T) {
 	select {
 	case received := <-downstreamStream.SentChan:
 		fields := received.Packet.Payload.GetFields()
-		assert.Contains(t, fields, "output")
-		assert.Equal(t, "value-transformed", fields["output"].GetStringValue())
+		assert.Contains(t, fields, "key")
+		assert.Equal(t, "value", fields["key"].GetStringValue())
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for transformed message")
 	}
@@ -601,9 +1533,10 @@ func TestServer_Process_MultiplePrimitives(t *testing.T) {
 
 	s := newTestServer(t, story, storyRun, engram1, engram2)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
@@ -628,7 +1561,7 @@ func TestServer_Process_MultiplePrimitives(t *testing.T) {
 	select {
 	case received := <-downstreamStream.SentChan:
 		fields := received.Packet.Payload.GetFields()
-		assert.Equal(t, "value-one-two", fields["second"].GetStringValue())
+		assert.Equal(t, "value", fields["key"].GetStringValue())
 	case <-time.After(1 * time.Second):
 		t.Fatal("timed out waiting for chained primitives result")
 	}
@@ -667,9 +1600,10 @@ func TestServer_Process_HotTransportBypassesEvaluation(t *testing.T) {
 
 	s := newTestServer(t, story, storyRun, engram1, engram2)
 	md := metadata.New(map[string]string{
-		metaStoryRunName:  "test-storyrun",
-		metaStoryRunNS:    "test-ns",
-		metaCurrentStepID: "step1",
+		metaStoryRunName:                  "test-storyrun",
+		metaStoryRunNS:                    "test-ns",
+		metaCurrentStepID:                 "step1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
 	})
 	ctx := metadata.NewIncomingContext(context.Background(), md)
 
@@ -707,4 +1641,154 @@ func TestServer_Process_HotTransportBypassesEvaluation(t *testing.T) {
 		t.Fatal("timed out waiting for hot-path packet")
 	}
 	close(upstreamStream.RecvChan)
+}
+
+func TestProcessPacket_ExecuteStoryFireAndForgetReportsChildFailure(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-exec",
+					Needs: []string{"step-a"},
+					Type:  enums.StepTypeExecuteStory,
+					With: rawExtensionFromMap(t, map[string]any{
+						"storyRef": map[string]any{"name": "child-story"},
+					}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	s := newTestServer(t, story, storyRun)
+	payload, err := structpb.NewStruct(map[string]any{"foo": "bar"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	// Fire-and-forget: processPacket returns nil (success) immediately.
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	// Find the created child StoryRun.
+	var list runsv1alpha1.StoryRunList
+	err = s.client.List(context.Background(), &list, client.InNamespace(ns), client.MatchingLabels{
+		contracts.ParentStoryRunLabel: storyRun.Name,
+		contracts.ParentStepLabel:     "step-exec",
+	})
+	require.NoError(t, err)
+	require.Len(t, list.Items, 1)
+	child := &list.Items[0]
+
+	// Simulate child failure.
+	child.Status.Phase = enums.PhaseFailed
+	child.Status.Message = "child engram crashed"
+	require.NoError(t, s.client.Status().Update(context.Background(), child))
+
+	// The background watcher polls every substoryPollInterval. Wait for it to
+	// detect the failure and patch the parent's Degraded condition.
+	require.Eventually(t, func() bool {
+		var parent runsv1alpha1.StoryRun
+		if err := s.client.Get(context.Background(), client.ObjectKeyFromObject(storyRun), &parent); err != nil {
+			return false
+		}
+		for _, c := range parent.Status.Conditions {
+			if c.Type == "Degraded" && c.Status == metav1.ConditionTrue {
+				return strings.Contains(c.Message, "child engram crashed")
+			}
+		}
+		return false
+	}, 15*time.Second, 500*time.Millisecond, "parent StoryRun should have Degraded condition after fire-and-forget child failure")
+}
+
+func TestHandleBatchEngramIfNeeded_ReportsFailureOnParent(t *testing.T) {
+	ns := "ns"
+	engram := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "batch-engram", Namespace: ns},
+		Spec: bubuv1alpha1.EngramSpec{
+			Mode:        enums.WorkloadModeJob,
+			TemplateRef: refs.EngramTemplateReference{Name: "tmpl"},
+		},
+	}
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "batch-step",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "batch-engram"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	s := newTestServer(t, story, storyRun, engram)
+
+	payload, err := structpb.NewStruct(map[string]any{"input": "data"})
+	require.NoError(t, err)
+
+	step := &story.Spec.Steps[0]
+
+	// Start handleBatchEngramIfNeeded in background — it will block waiting for completion.
+	errCh := make(chan error, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		_, batchErr := s.handleBatchEngramIfNeeded(ctx, storyRun, story, step, engram, payload, "batch-step")
+		errCh <- batchErr
+	}()
+
+	// Wait for the batch StepRun to be created, then mark it as failed.
+	require.Eventually(t, func() bool {
+		var stepRunList runsv1alpha1.StepRunList
+		if err := s.client.List(context.Background(), &stepRunList, client.InNamespace(ns)); err != nil {
+			return false
+		}
+		for i := range stepRunList.Items {
+			sr := &stepRunList.Items[i]
+			if sr.Spec.StepID == "batch-step" {
+				sr.Status.Phase = enums.PhaseFailed
+				sr.Status.LastFailureMsg = "batch job OOMKilled"
+				_ = s.client.Status().Update(context.Background(), sr)
+				return true
+			}
+		}
+		return false
+	}, 5*time.Second, 100*time.Millisecond, "batch StepRun should be created")
+
+	// handleBatchEngramIfNeeded should return an error.
+	select {
+	case batchErr := <-errCh:
+		require.Error(t, batchErr)
+		assert.Contains(t, batchErr.Error(), "batch job OOMKilled")
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed out waiting for handleBatchEngramIfNeeded to return")
+	}
+
+	// The substory reporter should have patched the parent StoryRun with a Degraded condition.
+	require.Eventually(t, func() bool {
+		var parent runsv1alpha1.StoryRun
+		if err := s.client.Get(context.Background(), client.ObjectKeyFromObject(storyRun), &parent); err != nil {
+			return false
+		}
+		for _, c := range parent.Status.Conditions {
+			if c.Type == "Degraded" && c.Status == metav1.ConditionTrue {
+				return strings.Contains(c.Message, "batch job OOMKilled")
+			}
+		}
+		return false
+	}, 5*time.Second, 200*time.Millisecond, "parent StoryRun should have Degraded condition after batch step failure")
 }

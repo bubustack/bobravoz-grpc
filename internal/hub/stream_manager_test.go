@@ -320,3 +320,226 @@ func TestEnsureStateConcurrent(t *testing.T) {
 		}
 	}
 }
+
+func TestAddStream_ShadowWithHigherGeneration(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	blue := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+
+	// Register blue (gen 1) as active stream.
+	blueEntry := sm.AddStream(ctx, "sr", "ns", "step", blue, 1)
+	if blueEntry == nil {
+		t.Fatal("expected blue entry")
+	}
+	if !sm.HasStream("sr", "ns", "step") {
+		t.Fatal("expected active stream")
+	}
+
+	// Register green (gen 2) — goes to shadow then auto-cutovers to active.
+	greenEntry := sm.AddStream(ctx, "sr", "ns", "step", green, 2)
+	if greenEntry == nil {
+		t.Fatal("expected green entry")
+	}
+
+	// Shadow should be empty after auto-cutover.
+	if sm.HasShadow("sr", "ns", "step") {
+		t.Fatal("expected shadow to be cleared after auto-cutover")
+	}
+
+	// Active stream should now be green (auto-promoted).
+	key := sm.streamKey("sr", "ns", "step")
+	val, _ := sm.streams.Load(key)
+	if val != greenEntry {
+		t.Fatal("expected green to be active stream after auto-cutover")
+	}
+
+	// Verify handoff phase is ready (cutover completed) and generation updated.
+	stateVal, _ := sm.states.Load(key)
+	state := stateVal.(*streamState)
+	state.mu.Lock()
+	phase := state.handoff.phase
+	gen := state.generation
+	shadowGen := state.shadowGeneration
+	state.mu.Unlock()
+	if phase != handoffPhaseReady {
+		t.Fatalf("expected ready phase after auto-cutover, got %s", phase)
+	}
+	if gen != 2 {
+		t.Fatalf("expected active generation 2, got %d", gen)
+	}
+	if shadowGen != 0 {
+		t.Fatalf("expected shadow generation 0 after cutover, got %d", shadowGen)
+	}
+
+	// Messages should route to green (active), not blue (closed).
+	msg := &transportpb.DataPacket{Metadata: map[string]string{"i": "1"}}
+	if ok := sm.SendOrBuffer(ctx, "sr", "ns", "step", msg); !ok {
+		t.Fatal("expected send to succeed")
+	}
+	if green.sendCount.Load() != 1 {
+		t.Fatalf("expected green to receive 1 message, got %d", green.sendCount.Load())
+	}
+	if blue.sendCount.Load() != 0 {
+		t.Fatalf("expected blue to receive 0 messages (closed), got %d", blue.sendCount.Load())
+	}
+}
+
+func TestCutoverShadow_PromotesShadowToActive(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	blue := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+
+	// Register blue (gen 1) then green (gen 2) — auto-cutover promotes green.
+	sm.AddStream(ctx, "sr", "ns", "step", blue, 1)
+	sm.AddStream(ctx, "sr", "ns", "step", green, 2)
+
+	// Shadow should already be cleared by auto-cutover.
+	if sm.HasShadow("sr", "ns", "step") {
+		t.Fatal("expected shadow to be cleared by auto-cutover")
+	}
+
+	// Calling CutoverShadow again should return false (no shadow).
+	if sm.CutoverShadow("sr", "ns", "step") {
+		t.Fatal("cutover should fail when shadow already auto-promoted")
+	}
+
+	// Messages should route to green (auto-promoted).
+	msg := &transportpb.DataPacket{Metadata: map[string]string{"i": "1"}}
+	if ok := sm.SendOrBuffer(ctx, "sr", "ns", "step", msg); !ok {
+		t.Fatal("expected send to succeed")
+	}
+	if green.sendCount.Load() != 1 {
+		t.Fatalf("expected green to receive 1 message, got %d", green.sendCount.Load())
+	}
+
+	// Verify generation updated.
+	key := sm.streamKey("sr", "ns", "step")
+	stateVal, _ := sm.states.Load(key)
+	state := stateVal.(*streamState)
+	state.mu.Lock()
+	gen := state.generation
+	state.mu.Unlock()
+	if gen != 2 {
+		t.Fatalf("expected active generation 2 after auto-cutover, got %d", gen)
+	}
+}
+
+func TestCutoverShadow_NoShadowReturnsFalse(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	s := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	sm.AddStream(ctx, "sr", "ns", "step", s, 1)
+
+	if sm.CutoverShadow("sr", "ns", "step") {
+		t.Fatal("cutover should fail when no shadow exists")
+	}
+}
+
+func TestRemoveStream_ShadowCleanup(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	blue := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+
+	sm.AddStream(ctx, "sr", "ns", "step", blue, 1)
+	greenEntry := sm.AddStream(ctx, "sr", "ns", "step", green, 2)
+
+	// After auto-cutover, shadow is cleared and green is active.
+	if sm.HasShadow("sr", "ns", "step") {
+		t.Fatal("shadow should be cleared by auto-cutover")
+	}
+
+	// Remove active (green) stream.
+	sm.RemoveStream("sr", "ns", "step", greenEntry)
+
+	// Active stream should be removed.
+	if sm.HasStream("sr", "ns", "step") {
+		t.Fatal("active stream should be removed after RemoveStream")
+	}
+}
+
+func TestAddStream_ThirdGenerationReplacesShadow(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	blue := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green2 := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+
+	sm.AddStream(ctx, "sr", "ns", "step", blue, 1)
+	sm.AddStream(ctx, "sr", "ns", "step", green, 2) // auto-cutovers: green becomes active
+	// Third connector with gen 3 — sees gen 2 as active, auto-cutovers to gen 3.
+	entry3 := sm.AddStream(ctx, "sr", "ns", "step", green2, 3)
+	if entry3 == nil {
+		t.Fatal("expected third entry")
+	}
+
+	// Shadow should be cleared by auto-cutover.
+	if sm.HasShadow("sr", "ns", "step") {
+		t.Fatal("expected shadow to be cleared after auto-cutover")
+	}
+
+	// Active stream should be gen 3.
+	key := sm.streamKey("sr", "ns", "step")
+	val, _ := sm.streams.Load(key)
+	if val != entry3 {
+		t.Fatal("expected gen 3 to be the active stream")
+	}
+
+	stateVal, _ := sm.states.Load(key)
+	state := stateVal.(*streamState)
+	state.mu.Lock()
+	gen := state.generation
+	shadowGen := state.shadowGeneration
+	state.mu.Unlock()
+	if gen != 3 {
+		t.Fatalf("expected active generation 3, got %d", gen)
+	}
+	if shadowGen != 0 {
+		t.Fatalf("expected shadow generation 0 after auto-cutover, got %d", shadowGen)
+	}
+}
+
+func TestAddStream_AutoCutoverOnShadowConnect(t *testing.T) {
+	sm := NewStreamManager(nil)
+	ctx := context.Background()
+	blue := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+	green := &countingProcessServer{mockProcessServer: &mockProcessServer{}}
+
+	// 1. Add blue stream with gen=1.
+	sm.AddStream(ctx, "sr", "ns", "step", blue, 1)
+
+	// 2. Add green stream with gen=2 — triggers auto-cutover.
+	sm.AddStream(ctx, "sr", "ns", "step", green, 2)
+
+	// 3. Verify green is now the active stream (auto-promoted).
+	key := sm.streamKey("sr", "ns", "step")
+	val, _ := sm.streams.Load(key)
+	entry, ok := val.(*streamEntry)
+	if !ok || entry == nil {
+		t.Fatal("expected active stream entry")
+	}
+	if entry.generation != 2 {
+		t.Fatalf("expected active generation 2, got %d", entry.generation)
+	}
+
+	// 4. Verify shadow map is empty.
+	if sm.HasShadow("sr", "ns", "step") {
+		t.Fatal("expected no shadow after auto-cutover")
+	}
+
+	// 5. Verify messages route to green.
+	msg := &transportpb.DataPacket{Metadata: map[string]string{"i": "auto"}}
+	if ok := sm.SendOrBuffer(ctx, "sr", "ns", "step", msg); !ok {
+		t.Fatal("expected send to succeed")
+	}
+	if green.sendCount.Load() != 1 {
+		t.Fatalf("expected green to receive 1 message, got %d", green.sendCount.Load())
+	}
+
+	// 6. Verify blue stream was closed (did not receive the message).
+	if blue.sendCount.Load() != 0 {
+		t.Fatalf("expected blue to receive 0 messages after cutover, got %d", blue.sendCount.Load())
+	}
+}

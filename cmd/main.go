@@ -47,6 +47,7 @@ import (
 
 	"github.com/go-logr/logr"
 
+	catalogv1alpha1 "github.com/bubustack/bobrapet/api/catalog/v1alpha1"
 	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
 	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
 	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
@@ -75,6 +76,7 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(bubuv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(catalogv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(runsv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(transportv1alpha1.AddToScheme(scheme))
 
@@ -272,10 +274,9 @@ func main() {
 
 	cfg := operatorConfigManager.GetConfig()
 	templateCfg := templating.Config{
-		EvaluationTimeout:   cfg.Templating.EvaluationTimeout,
-		MaxExpressionLength: cfg.Templating.MaxExpressionLength,
-		MaxOutputBytes:      cfg.Templating.MaxOutputBytes,
-		Deterministic:       cfg.Templating.Deterministic,
+		EvaluationTimeout: cfg.Templating.EvaluationTimeout,
+		MaxOutputBytes:    cfg.Templating.MaxOutputBytes,
+		Deterministic:     cfg.Templating.Deterministic,
 	}
 
 	if _, ok := os.LookupEnv(contracts.TransportSecurityModeEnv); !ok {
@@ -321,7 +322,17 @@ func main() {
 			"configName", operatorConfigName)
 	}
 
-	telemetry.InitFromEnv()
+	if err := telemetry.InitFromEnv("bobravoz-grpc"); err != nil {
+		setupLog.Error(err, "failed to initialize OTEL tracer provider")
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telemetry.Shutdown(shutdownCtx); err != nil {
+			setupLog.Error(err, "failed to shutdown OTEL tracer provider")
+		}
+	}()
 
 	allowInsecure, err := configureHubTLSFromSecret()
 	if err != nil {
@@ -565,6 +576,21 @@ func applyHubEnvFromConfig(logger logr.Logger, cfg *config.OperatorConfig) error
 		return fmt.Errorf("set %s: %w", contracts.HubPerMessageTimeoutEnv, err)
 	} else if set {
 		logger.Info("hub per-message timeout derived from operator config", "env", contracts.HubPerMessageTimeoutEnv, "value", hubCfg.PerMessageTimeout)
+	}
+	if set, err := setIntEnvIfUnset(contracts.HubMaxActiveStreamsEnv, hubCfg.MaxActiveStreams); err != nil {
+		return fmt.Errorf("set %s: %w", contracts.HubMaxActiveStreamsEnv, err)
+	} else if set {
+		logger.Info("hub max active streams derived from operator config", "env", contracts.HubMaxActiveStreamsEnv, "value", hubCfg.MaxActiveStreams)
+	}
+	if set, err := setIntEnvIfUnset(contracts.HubMaxBuffersEnv, hubCfg.MaxBuffers); err != nil {
+		return fmt.Errorf("set %s: %w", contracts.HubMaxBuffersEnv, err)
+	} else if set {
+		logger.Info("hub max buffers derived from operator config", "env", contracts.HubMaxBuffersEnv, "value", hubCfg.MaxBuffers)
+	}
+	if set, err := setIntEnvIfUnset(contracts.HubMaxDownstreamsEnv, hubCfg.MaxDownstreamsHardCap); err != nil {
+		return fmt.Errorf("set %s: %w", contracts.HubMaxDownstreamsEnv, err)
+	} else if set {
+		logger.Info("hub max downstreams hard cap derived from operator config", "env", contracts.HubMaxDownstreamsEnv, "value", hubCfg.MaxDownstreamsHardCap)
 	}
 
 	return nil

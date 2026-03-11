@@ -31,3 +31,8 @@ go.work
 
 .DS_Store
 dist/
+
+# Claude Code
+.claude/settings.local.json
+
+docs/deep-research/
