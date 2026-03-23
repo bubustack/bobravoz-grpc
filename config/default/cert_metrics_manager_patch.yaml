@@ -5,7 +5,7 @@
   path: /spec/template/spec/containers/0/volumeMounts/-
   value:
     mountPath: /tmp/k8s-metrics-server/metrics-certs
-    name: metrics-certs
+    name: bobravoz-grpc-metrics-server-cert
     readOnly: true
 
 # Add the --metrics-cert-path argument for the metrics server
@@ -17,9 +17,9 @@
 - op: add
   path: /spec/template/spec/volumes/-
   value:
-    name: metrics-certs
+    name: bobravoz-grpc-metrics-server-cert
     secret:
-      secretName: metrics-server-cert
+      secretName: bobravoz-grpc-metrics-server-cert
       optional: false
       items:
         - key: ca.crt

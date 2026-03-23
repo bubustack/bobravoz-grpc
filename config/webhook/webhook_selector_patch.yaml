@@ -1,0 +1,10 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: transport-connector-mutating-webhook-configuration
+webhooks:
+  - name: mtransport-connector.bobravoz.bubustack.io
+    objectSelector:
+      matchExpressions:
+        - key: bubustack.io/engram
+          operator: Exists

@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "bobravoz.configName" . }}
+  namespace: {{ include "bobravoz.effectiveConfigNamespace" . }}
+  labels:
+    {{- include "bobravoz.labels" . | nindent 4 }}
+data:
+  {{- range $key, $value := .Values.operatorConfigData }}
+  {{ $key }}: {{ $value | quote }}
+  {{- end }}
