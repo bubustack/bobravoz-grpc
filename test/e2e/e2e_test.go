@@ -2,7 +2,7 @@
 // +build e2e
 
 /*
-Copyright 2025 BubuStack.
+Copyright 2026.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,7 +25,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -35,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "bobrapet-system"
+const namespace = "bobravoz-grpc-system"
 
 // serviceAccountName created for the project
 const serviceAccountName = "bobravoz-grpc-controller-manager"
@@ -55,10 +54,8 @@ var _ = Describe("Manager", Ordered, func() {
 	BeforeAll(func() {
 		By("creating manager namespace")
 		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		output, err := utils.Run(cmd)
-		if err != nil && !strings.Contains(output, "AlreadyExists") {
-			Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-		}
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
 		By("labeling the namespace to enforce the restricted security policy")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,

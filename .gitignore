@@ -28,11 +28,3 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
-
-.DS_Store
-dist/
-
-# Claude Code
-.claude/settings.local.json
-
-docs/deep-research/
