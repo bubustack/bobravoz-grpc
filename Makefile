@@ -1,5 +1,8 @@
 # Image URL to use all building/pushing image targets
-IMG ?= controller:latest
+IMG ?= ghcr.io/bubustack/bobravoz-grpc:latest
+CONNECTOR_IMG ?= ghcr.io/bubustack/bobravoz-grpc-connector:latest
+CHART ?= bobravoz-grpc
+CHART_OVERRIDE_DIR ?= hack/charts
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -61,7 +64,6 @@ vet: ## Run go vet against code.
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
 
-# TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
 # CertManager is installed by default; skip with:
 # - CERT_MANAGER_INSTALL_SKIP=true
@@ -117,11 +119,19 @@ run: manifests generate fmt vet ## Run a controller from your host.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
-	$(CONTAINER_TOOL) build -t ${IMG} .
+	DOCKER_BUILDKIT=1 $(CONTAINER_TOOL) build -t ${IMG} .
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
+
+.PHONY: docker-build-connector
+docker-build-connector: ## Build docker image with the LiveKit connector.
+	DOCKER_BUILDKIT=1 $(CONTAINER_TOOL) build -t ${CONNECTOR_IMG} -f Dockerfile.connector .
+
+.PHONY: docker-push-connector
+docker-push-connector: ## Push the connector image.
+	$(CONTAINER_TOOL) push ${CONNECTOR_IMG}
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/mypoperator:0.0.1). To use this option you need to:
@@ -132,19 +142,35 @@ docker-push: ## Push docker image with the manager.
 PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
 .PHONY: docker-buildx
 docker-buildx: ## Build and push docker image for the manager for cross-platform support
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' Dockerfile > Dockerfile.cross
 	- $(CONTAINER_TOOL) buildx create --name bobravoz-grpc-builder
 	$(CONTAINER_TOOL) buildx use bobravoz-grpc-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} -f Dockerfile.cross .
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${IMG} .
 	- $(CONTAINER_TOOL) buildx rm bobravoz-grpc-builder
-	rm Dockerfile.cross
+
+.PHONY: docker-buildx-connector
+docker-buildx-connector: ## Build and push the connector image for cross-platform support
+	- $(CONTAINER_TOOL) buildx create --name bobravoz-connector-builder
+	$(CONTAINER_TOOL) buildx use bobravoz-connector-builder
+	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag ${CONNECTOR_IMG} -f Dockerfile.connector .
+	- $(CONTAINER_TOOL) buildx rm bobravoz-connector-builder
 
 .PHONY: build-installer
 build-installer: manifests generate kustomize ## Generate a consolidated YAML with CRDs and deployment.
 	mkdir -p dist
 	cd config/manager && "$(KUSTOMIZE)" edit set image controller=${IMG}
 	"$(KUSTOMIZE)" build config/default > dist/install.yaml
+
+##@ Helm
+
+.PHONY: helm-chart
+helm-chart: helmify helm-schema kustomize ## Generate Helm chart via helmify (override CHART=<name> if needed)
+	rm -rf dist/charts/$(CHART)
+	mkdir -p dist/charts
+	$(KUSTOMIZE) build config/default | $(HELMIFY) -crd-dir dist/charts/$(CHART)
+	if [ -d $(CHART_OVERRIDE_DIR)/$(CHART) ]; then \
+		cp -R $(CHART_OVERRIDE_DIR)/$(CHART)/. dist/charts/$(CHART)/; \
+	fi
+	$(HELM_SCHEMA) -f dist/charts/$(CHART)/values.yaml -o dist/charts/$(CHART)/values.schema.json
 
 ##@ Deployment
 
@@ -185,11 +211,14 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
+GO_VERSION ?= $(shell go env GOVERSION)
+GOLANGCI_LINT_CUSTOM = $(LOCALBIN)/golangci-lint-custom-$(GOLANGCI_LINT_VERSION)-$(GO_VERSION)
+HELMIFY ?= $(LOCALBIN)/helmify
+HELM_SCHEMA ?= $(LOCALBIN)/helm-values-schema-json
 
 ## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
-
 #ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
 ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
@@ -200,7 +229,9 @@ ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
   [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
   printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
 
-GOLANGCI_LINT_VERSION ?= v2.8.0
+GOLANGCI_LINT_VERSION ?= v2.11.4
+HELMIFY_VERSION ?= v0.4.19
+HELM_SCHEMA_VERSION ?= v2.3.1
 .PHONY: kustomize
 kustomize: $(KUSTOMIZE) ## Download kustomize locally if necessary.
 $(KUSTOMIZE): $(LOCALBIN)
@@ -225,14 +256,27 @@ $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
 .PHONY: golangci-lint
-golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
-$(GOLANGCI_LINT): $(LOCALBIN)
+golangci-lint: $(LOCALBIN) ## Download golangci-lint locally if necessary.
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@test -f .custom-gcl.yml && { \
-		echo "Building custom golangci-lint with plugins..." && \
-		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
-		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
-	} || true
+	@if [ -f .custom-gcl.yml ]; then \
+		if [ ! -x "$(GOLANGCI_LINT_CUSTOM)" ] || [ .custom-gcl.yml -nt "$(GOLANGCI_LINT_CUSTOM)" ] || [ "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)" -nt "$(GOLANGCI_LINT_CUSTOM)" ]; then \
+			echo "Building custom golangci-lint with plugins..." && \
+			"$(GOLANGCI_LINT)" custom --destination "$(LOCALBIN)" --name "$$(basename "$(GOLANGCI_LINT_CUSTOM)")"; \
+		fi; \
+		ln -sf "$$(realpath "$(GOLANGCI_LINT_CUSTOM)")" "$(GOLANGCI_LINT)"; \
+	else \
+		ln -sf "$$(realpath "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)")" "$(GOLANGCI_LINT)"; \
+	fi
+
+.PHONY: helmify
+helmify: $(HELMIFY) ## Download helmify locally if necessary.
+$(HELMIFY): $(LOCALBIN)
+	$(call go-install-tool,$(HELMIFY),github.com/arttor/helmify/cmd/helmify,$(HELMIFY_VERSION))
+
+.PHONY: helm-schema
+helm-schema: $(HELM_SCHEMA) ## Download helm-values-schema-json locally if necessary.
+$(HELM_SCHEMA): $(LOCALBIN)
+	$(call go-install-tool,$(HELM_SCHEMA),github.com/losisin/helm-values-schema-json/v2,$(HELM_SCHEMA_VERSION))
 
 # go-install-tool will 'go install' any package with custom target and name of binary, if it doesn't exist
 # $1 - target path with name of binary
@@ -253,3 +297,5 @@ endef
 define gomodver
 $(shell go list -m -f '{{if .Replace}}{{.Replace.Version}}{{else}}{{.Version}}{{end}}' $(1) 2>/dev/null)
 endef
+
+-include hack/makefiles/*

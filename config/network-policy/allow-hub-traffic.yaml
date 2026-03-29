@@ -1,0 +1,28 @@
+# This NetworkPolicy restricts hub gRPC ingress to pods that have the injected
+# transport connector label, regardless of namespace.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: bobravoz-grpc
+    app.kubernetes.io/managed-by: kustomize
+  name: allow-hub-traffic
+  namespace: system
+spec:
+  podSelector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: bobravoz-grpc
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        # TODO(security): Restrict to specific namespaces where StoryRuns are expected.
+        # Currently allows any namespace with connector-labeled pods.
+        - namespaceSelector: {}
+          podSelector:
+            matchLabels:
+              transport.bobravoz.bubustack.io/connector: "true"
+      ports:
+        - port: 9000
+          protocol: TCP

@@ -1,0 +1,15 @@
+{{- if and .Values.pdb.enabled (gt (int .Values.replicaCount) 1) }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "bobravoz.fullname" . }}-controller-manager
+  namespace: {{ include "bobravoz.namespace" . }}
+  labels:
+    {{- include "bobravoz.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.pdb.minAvailable }}
+  selector:
+    matchLabels:
+      control-plane: controller-manager
+      {{- include "bobravoz.selectorLabels" . | nindent 6 }}
+{{- end }}

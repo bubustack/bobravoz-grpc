@@ -4,6 +4,7 @@
 *.dll
 *.so
 *.dylib
+connector
 bin/*
 Dockerfile.cross
 
@@ -28,3 +29,7 @@ go.work
 
 # Kubeconfig might contain secrets
 *.kubeconfig
+
+.DS_Store
+logs.txt
+dist/

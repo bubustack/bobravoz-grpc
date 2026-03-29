@@ -1,0 +1,34 @@
+apiVersion: v2
+name: bobravoz-grpc
+description: >
+  Transport mesh and hub for BubuStack Stories. Fans out realtime audio/video/binary
+  streams and applies transport primitives between Engrams.
+type: application
+# version and appVersion are updated automatically by Release Please on release.
+version: 0.0.0
+appVersion: "0.0.0"
+icon: https://bubustack.io/img/logo.svg
+home: https://github.com/bubustack/bobravoz-grpc
+sources:
+  - https://github.com/bubustack/bobravoz-grpc
+  - https://github.com/bubustack/bobrapet
+maintainers:
+  - name: BubuStack
+    url: https://bubustack.io
+keywords:
+  - grpc
+  - transport
+  - streaming
+  - kubernetes
+  - bubustack
+annotations:
+  artifacthub.io/containsSecurityUpdates: "false"
+  artifacthub.io/license: Apache-2.0
+  artifacthub.io/category: networking
+  artifacthub.io/links: |
+    - name: Documentation
+      url: https://bubustack.io/docs/transport
+    - name: Workflow Operator
+      url: https://github.com/bubustack/bobrapet
+    - name: Engram Catalog
+      url: https://github.com/bubustack?tab=repositories&q=engram

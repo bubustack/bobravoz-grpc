@@ -30,10 +30,9 @@ spec:
         control-plane: controller-manager
         app.kubernetes.io/name: bobravoz-grpc
     spec:
-      # TODO(user): Uncomment the following code to configure the nodeAffinity expression
-      # according to the platforms which are supported by your solution.
-      # It is considered best practice to support multiple architectures. You can
-      # build your manager image using the makefile target docker-buildx.
+      # Optional multi-arch affinity example. Uncomment and tailor this block if
+      # you need to pin the manager to a specific set of CPU architectures.
+      # Multi-arch images can be built with `make docker-buildx`.
       # affinity:
       #   nodeAffinity:
       #     requiredDuringSchedulingIgnoredDuringExecution:
@@ -61,11 +60,37 @@ spec:
       - command:
         - /manager
         args:
-          - --leader-elect
+          # - --leader-elect
           - --health-probe-bind-address=:8081
+          - --hub-port=9000
+          - --config-namespace=bobrapet-system
+          - --config-name=bobravoz-grpc-operator-config
         image: controller:latest
+        imagePullPolicy: IfNotPresent
         name: manager
-        ports: []
+        env:
+        - name: BUBU_HUB_SERVICE_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: BUBU_HUB_SERVICE_NAME
+          value: bobravoz-grpc-hub
+        - name: CONNECTOR_IMAGE
+          value: ghcr.io/bubustack/bobravoz-grpc-connector:latest
+        - name: CONNECTOR_IMAGE_PULL_POLICY
+          value: IfNotPresent
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        ports:
+        - containerPort: 9000
+          name: grpc
+          protocol: TCP
         securityContext:
           readOnlyRootFilesystem: true
           allowPrivilegeEscalation: false
@@ -84,16 +109,22 @@ spec:
             port: 8081
           initialDelaySeconds: 5
           periodSeconds: 10
-        # TODO(user): Configure the resources accordingly based on the project requirements.
-        # More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
+        # Default resource settings for the controller manager. Tune these values
+        # per cluster size and transport throughput requirements.
         resources:
           limits:
             cpu: 500m
-            memory: 128Mi
+            memory: 256Mi
           requests:
             cpu: 10m
             memory: 64Mi
-        volumeMounts: []
-      volumes: []
+        volumeMounts:
+        - name: bobravoz-grpc-hub-tls
+          mountPath: /var/run/hub-tls
+          readOnly: true
+      volumes:
+      - name: bobravoz-grpc-hub-tls
+        secret:
+          secretName: bobravoz-grpc-hub-tls
       serviceAccountName: controller-manager
       terminationGracePeriodSeconds: 10

@@ -1,0 +1,21 @@
+# Admission webhooks are called by kube-apiserver, which may run outside normal
+# pod namespaces. Keep the webhook listener open while other ports stay scoped.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: bobravoz-grpc
+    app.kubernetes.io/managed-by: kustomize
+  name: allow-webhook-traffic
+  namespace: system
+spec:
+  podSelector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: bobravoz-grpc
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 9443
+          protocol: TCP

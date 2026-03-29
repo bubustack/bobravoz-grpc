@@ -1,2 +1,5 @@
 resources:
 - allow-metrics-traffic.yaml
+- allow-hub-traffic.yaml
+- allow-webhook-traffic.yaml
+- allow-health-probe-traffic.yaml

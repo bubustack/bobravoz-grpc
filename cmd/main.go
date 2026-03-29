@@ -1,5 +1,5 @@
 /*
-Copyright 2026.
+Copyright 2025 BubuStack.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,23 +17,48 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"flag"
+	"fmt"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	crclient "sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
-	"sigs.k8s.io/controller-runtime/pkg/webhook"
+
+	"go.uber.org/zap/zapcore"
+
+	"github.com/go-logr/logr"
+
+	catalogv1alpha1 "github.com/bubustack/bobrapet/api/catalog/v1alpha1"
+	runsv1alpha1 "github.com/bubustack/bobrapet/api/runs/v1alpha1"
+	transportv1alpha1 "github.com/bubustack/bobrapet/api/transport/v1alpha1"
+	bubuv1alpha1 "github.com/bubustack/bobrapet/api/v1alpha1"
+	"github.com/bubustack/bobravoz-grpc/internal/config"
+	"github.com/bubustack/bobravoz-grpc/internal/controller"
+	"github.com/bubustack/bobravoz-grpc/internal/hub"
+	"github.com/bubustack/bobravoz-grpc/internal/telemetry"
+	podwebhook "github.com/bubustack/bobravoz-grpc/internal/webhook/pod"
+	"github.com/bubustack/core/contracts"
+	bootstrapruntime "github.com/bubustack/core/runtime/bootstrap"
+	"github.com/bubustack/core/templating"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -42,22 +67,50 @@ var (
 	setupLog = ctrl.Log.WithName("setup")
 )
 
+const (
+	managerContainerName = "manager"
+)
+
+type healthCheckRegistrar interface {
+	AddHealthzCheck(name string, check healthz.Checker) error
+	AddReadyzCheck(name string, check healthz.Checker) error
+}
+
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
+	utilruntime.Must(bubuv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(catalogv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(runsv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(transportv1alpha1.AddToScheme(scheme))
+
 	// +kubebuilder:scaffold:scheme
+}
+
+func registerHealthChecks(mgr healthCheckRegistrar) error {
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		return fmt.Errorf("add healthz check: %w", err)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		return fmt.Errorf("add readyz check: %w", err)
+	}
+	return nil
 }
 
 // nolint:gocyclo
 func main() {
 	var metricsAddr string
 	var metricsCertPath, metricsCertName, metricsCertKey string
-	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
+	var hubPort int
+	var connectorImage string
+	var connectorImagePullPolicy string
+	var operatorConfigNamespace string
+	var operatorConfigName string
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -66,22 +119,72 @@ func main() {
 			"Enabling this will ensure there is only one active controller manager.")
 	flag.BoolVar(&secureMetrics, "metrics-secure", true,
 		"If set, the metrics endpoint is served securely via HTTPS. Use --metrics-secure=false to use HTTP instead.")
-	flag.StringVar(&webhookCertPath, "webhook-cert-path", "", "The directory that contains the webhook certificate.")
-	flag.StringVar(&webhookCertName, "webhook-cert-name", "tls.crt", "The name of the webhook certificate file.")
-	flag.StringVar(&webhookCertKey, "webhook-cert-key", "tls.key", "The name of the webhook key file.")
 	flag.StringVar(&metricsCertPath, "metrics-cert-path", "",
 		"The directory that contains the metrics server certificate.")
 	flag.StringVar(&metricsCertName, "metrics-cert-name", "tls.crt", "The name of the metrics server certificate file.")
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.IntVar(&hubPort, "hub-port", 9000, "The port for the gRPC hub server.")
+	connectorImageDefault := os.Getenv("CONNECTOR_IMAGE")
+	if connectorImageDefault == "" {
+		connectorImageDefault = config.DefaultConnectorImage
+	}
+	flag.StringVar(
+		&connectorImage,
+		"connector-image",
+		connectorImageDefault,
+		"Container image for injected connector sidecars.",
+	)
+	connectorPolicyDefault := os.Getenv("CONNECTOR_IMAGE_PULL_POLICY")
+	if connectorPolicyDefault == "" {
+		connectorPolicyDefault = string(corev1.PullIfNotPresent)
+	}
+	flag.StringVar(
+		&connectorImagePullPolicy,
+		"connector-image-pull-policy",
+		connectorPolicyDefault,
+		"Image pull policy for connector sidecars.",
+	)
+	flag.StringVar(&operatorConfigNamespace, "config-namespace", "bobrapet-system",
+		"The namespace containing the operator configuration ConfigMap.")
+	flag.StringVar(&operatorConfigName, "config-name", "bobravoz-grpc-operator-config",
+		"The name of the operator configuration ConfigMap.")
 	opts := zap.Options{
-		Development: true,
+		Development: false,
 	}
 	opts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
+	connectorImageFlag := flag.CommandLine.Lookup("connector-image")
+	connectorImageFlagOverride := connectorImageFlag != nil &&
+		connectorImageFlag.Value.String() != connectorImageFlag.DefValue
+	connectorImageEnvOverride := os.Getenv("CONNECTOR_IMAGE") != ""
+	connectorImageExplicit := connectorImageFlagOverride || connectorImageEnvOverride
+
+	connectorPolicyFlag := flag.CommandLine.Lookup("connector-image-pull-policy")
+	connectorPolicyFlagOverride := connectorPolicyFlag != nil &&
+		connectorPolicyFlag.Value.String() != connectorPolicyFlag.DefValue
+	connectorPolicyEnvOverride := os.Getenv("CONNECTOR_IMAGE_PULL_POLICY") != ""
+	connectorPolicyExplicit := connectorPolicyFlagOverride || connectorPolicyEnvOverride
+
+	if os.Getenv(contracts.HubPortEnv) == "" {
+		_ = os.Setenv(contracts.HubPortEnv, strconv.Itoa(hubPort))
+	}
+	if os.Getenv(contracts.HubServiceNameEnv) == "" {
+		_ = os.Setenv(contracts.HubServiceNameEnv, "bobravoz-grpc-hub")
+	}
+
+	if debugLoggingEnabled() {
+		opts.Development = true
+		opts.Level = zapcore.DebugLevel
+	}
+
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	setupLog = ctrl.Log.WithName("setup")
+	if debugLoggingEnabled() {
+		setupLog.Info("debug logging enabled via BUBU_DEBUG")
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will
@@ -97,23 +200,6 @@ func main() {
 	if !enableHTTP2 {
 		tlsOpts = append(tlsOpts, disableHTTP2)
 	}
-
-	// Initial webhook TLS options
-	webhookTLSOpts := tlsOpts
-	webhookServerOptions := webhook.Options{
-		TLSOpts: webhookTLSOpts,
-	}
-
-	if len(webhookCertPath) > 0 {
-		setupLog.Info("Initializing webhook certificate watcher using provided certificates",
-			"webhook-cert-path", webhookCertPath, "webhook-cert-name", webhookCertName, "webhook-cert-key", webhookCertKey)
-
-		webhookServerOptions.CertDir = webhookCertPath
-		webhookServerOptions.CertName = webhookCertName
-		webhookServerOptions.KeyName = webhookCertKey
-	}
-
-	webhookServer := webhook.NewServer(webhookServerOptions)
 
 	// Metrics endpoint is enabled in 'config/default/kustomization.yaml'. The Metrics options configure the server.
 	// More info:
@@ -137,10 +223,9 @@ func main() {
 	// generate self-signed certificates for the metrics server. While convenient for development and testing,
 	// this setup is not recommended for production.
 	//
-	// TODO(user): If you enable certManager, uncomment the following lines:
-	// - [METRICS-WITH-CERTS] at config/default/kustomization.yaml to generate and use certificates
-	// managed by cert-manager for the metrics server.
-	// - [PROMETHEUS-WITH-CERTS] at config/prometheus/kustomization.yaml for TLS certification.
+	// For cert-manager-managed metrics TLS, enable the [METRICS-WITH-CERTS]
+	// patch in config/default/kustomization.yaml and the
+	// [PROMETHEUS-WITH-CERTS] patch in config/prometheus/kustomization.yaml.
 	if len(metricsCertPath) > 0 {
 		setupLog.Info("Initializing metrics certificate watcher using provided certificates",
 			"metrics-cert-path", metricsCertPath, "metrics-cert-name", metricsCertName, "metrics-cert-key", metricsCertKey)
@@ -153,7 +238,6 @@ func main() {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: probeAddr,
 		LeaderElection:         enableLeaderElection,
 		LeaderElectionID:       "184655c9.bubustack.io",
@@ -174,20 +258,482 @@ func main() {
 		os.Exit(1)
 	}
 
+	signalCtx := ctrl.SetupSignalHandler()
+	ctx, cancel := context.WithCancel(signalCtx)
+	defer cancel()
+
+	operatorConfigManager, err := config.NewOperatorConfigManager(
+		mgr.GetClient(),
+		operatorConfigNamespace,
+		operatorConfigName,
+	)
+	if err != nil {
+		setupLog.Error(err, "unable to create operator config manager")
+		os.Exit(1)
+	}
+	operatorConfigManager.SetAPIReader(mgr.GetAPIReader())
+	if err := operatorConfigManager.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to set up operator config manager")
+		os.Exit(1)
+	}
+
+	loadCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	if err := operatorConfigManager.LoadInitial(loadCtx); err != nil {
+		if apierrors.IsNotFound(err) {
+			setupLog.Info("operator config map not found; using defaults",
+				"configNamespace", operatorConfigNamespace,
+				"configName", operatorConfigName)
+		} else {
+			setupLog.Error(err, "failed to load operator configuration",
+				"configNamespace", operatorConfigNamespace,
+				"configName", operatorConfigName)
+			cancel()
+			os.Exit(1)
+		}
+	}
+	cancel()
+
+	cfg := operatorConfigManager.GetConfig()
+	templateCfg := templating.Config{
+		EvaluationTimeout: cfg.Templating.EvaluationTimeout,
+		MaxOutputBytes:    cfg.Templating.MaxOutputBytes,
+		Deterministic:     cfg.Templating.Deterministic,
+	}
+
+	if _, ok := os.LookupEnv(contracts.TransportSecurityModeEnv); !ok {
+		mode := contracts.TransportSecurityModeTLS
+		if err := os.Setenv(contracts.TransportSecurityModeEnv, mode); err != nil {
+			setupLog.Error(err, "failed to propagate transport security mode env from operator config")
+			os.Exit(1)
+		}
+		setupLog.Info("hub transport security mode derived from operator config",
+			"value", mode,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+
+	if _, ok := os.LookupEnv(contracts.TracePropagationEnv); !ok {
+		if err := os.Setenv(contracts.TracePropagationEnv, strconv.FormatBool(cfg.Telemetry.TracePropagation)); err != nil {
+			setupLog.Error(err, "failed to propagate trace propagation env from operator config")
+			os.Exit(1)
+		}
+		setupLog.Info("trace propagation derived from operator config",
+			"value", cfg.Telemetry.TracePropagation,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+
+	if err := applyHubEnvFromConfig(setupLog, cfg); err != nil {
+		setupLog.Error(err, "failed to propagate hub tuning env from operator config")
+		os.Exit(1)
+	}
+
+	if cfg.Connector.Image != "" && !connectorImageExplicit {
+		connectorImage = cfg.Connector.Image
+		setupLog.Info("connector image derived from operator config",
+			"value", connectorImage,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+	if cfg.Connector.ImagePullPolicy != "" && !connectorPolicyExplicit {
+		connectorImagePullPolicy = string(cfg.Connector.ImagePullPolicy)
+		setupLog.Info("connector image pull policy derived from operator config",
+			"value", connectorImagePullPolicy,
+			"configNamespace", operatorConfigNamespace,
+			"configName", operatorConfigName)
+	}
+
+	if err := telemetry.InitFromEnv("bobravoz-grpc"); err != nil {
+		setupLog.Error(err, "failed to initialize OTEL tracer provider")
+		os.Exit(1)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := telemetry.Shutdown(shutdownCtx); err != nil {
+			setupLog.Error(err, "failed to shutdown OTEL tracer provider")
+		}
+	}()
+
+	if err := configureHubTLSFromSecret(); err != nil {
+		setupLog.Error(err, "failed to configure hub TLS")
+		os.Exit(1)
+	}
+
+	connectorPolicy := corev1.PullPolicy(connectorImagePullPolicy)
+	connectorImage = strings.TrimSpace(connectorImage)
+	if shouldInferConnectorImage(connectorImage) {
+		if inferred, inferErr := inferConnectorImage(context.Background(), mgr.GetAPIReader()); inferErr != nil {
+			setupLog.Info("using configured connector image", "image", connectorImage, "reason", inferErr.Error())
+		} else if inferred != "" {
+			setupLog.Info("using manager image for connector", "image", inferred)
+			connectorImage = inferred
+		}
+	}
+	bootstrapRunner := bootstrapruntime.Runner{Log: setupLog.WithName("bootstrap")}
+	if err := bootstrapRunner.Register(
+		bootstrapruntime.Entry{
+			Kind:           "webhook",
+			Name:           "Connector",
+			ErrMessage:     "unable to configure connector webhook",
+			SuccessMessage: "connector webhook configured",
+			Register: func() error {
+				return setupConnectorWebhook(mgr, connectorImage, connectorPolicy)
+			},
+		},
+		bootstrapruntime.Entry{
+			Kind:           "controller",
+			Name:           "BobravozGRPC",
+			ErrMessage:     "unable to create controller",
+			SuccessMessage: "controller registered",
+			Fields:         []any{"controller", "BobravozGRPC"},
+			Register: func() error {
+				return (&controller.TransportReconciler{
+					Client: mgr.GetClient(),
+					Scheme: mgr.GetScheme(),
+				}).SetupWithManager(mgr)
+			},
+		},
+		bootstrapruntime.Entry{
+			Kind:           "health",
+			Name:           "checks",
+			ErrMessage:     "unable to set up health checks",
+			SuccessMessage: "health checks registered",
+			Register: func() error {
+				return registerHealthChecks(mgr)
+			},
+		},
+	); err != nil {
+		os.Exit(1)
+	}
+
 	// +kubebuilder:scaffold:builder
 
-	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "Failed to set up health check")
+	// Start the gRPC hub server
+	var hubServer *hub.Server
+	hubRunner := bootstrapruntime.Runner{Log: setupLog.WithName("hub")}
+	if err := hubRunner.Register(
+		bootstrapruntime.Entry{
+			Kind:           "hub",
+			Name:           "server",
+			ErrMessage:     "unable to create hub server",
+			SuccessMessage: "hub server initialized",
+			Register: func() error {
+				var serverErr error
+				hubServer, serverErr = hub.NewServer(
+					ctx,
+					mgr.GetClient(),
+					templateCfg,
+					cfg.Templating.OffloadedPolicy,
+					cfg.Templating.MaterializeEngram,
+				)
+				return serverErr
+			},
+		},
+	); err != nil {
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "Failed to set up ready check")
-		os.Exit(1)
-	}
+	defer hubServer.Close()
+
+	hubErrCh := make(chan error, 1)
+	go func() {
+		hubErrCh <- hubServer.Start(ctx, hubPort)
+	}()
+
+	// Monitor hub server in a separate goroutine — if it fails, cancel the
+	// manager context so the process shuts down cleanly instead of calling
+	// os.Exit from a goroutine (which bypasses deferred cleanup).
+	go func() {
+		if err := <-hubErrCh; err != nil {
+			setupLog.Error(err, "hub server failed, shutting down manager")
+			cancel()
+		}
+	}()
 
 	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
+	}
+}
+
+func configureHubTLSFromSecret() error {
+	certConfigured := ensureEnvFromFile(contracts.HubTLSCertFileEnv, hub.DefaultHubTLSCert)
+	keyConfigured := ensureEnvFromFile(contracts.HubTLSKeyFileEnv, hub.DefaultHubTLSKey)
+	caConfigured := ensureEnvFromFile(contracts.HubCAFileEnv, hub.DefaultHubTLSCA)
+
+	_, explicitlySet, err := resolveSecurityMode()
+	if err != nil {
+		return err
+	}
+	if !certConfigured || !keyConfigured || !caConfigured {
+		return fmt.Errorf(
+			"hub TLS requires %s, %s, and %s to be configured",
+			contracts.HubTLSCertFileEnv,
+			contracts.HubTLSKeyFileEnv,
+			contracts.HubCAFileEnv,
+		)
+	}
+	if !explicitlySet {
+		setupLog.Info(
+			"Hub transport security mode defaulted to TLS",
+			"env", contracts.TransportSecurityModeEnv,
+			"value", contracts.TransportSecurityModeTLS,
+		)
+	}
+	setupLog.Info(
+		"Enabling hub TLS",
+		"cert", os.Getenv(contracts.HubTLSCertFileEnv),
+		"key", os.Getenv(contracts.HubTLSKeyFileEnv),
+		"ca", os.Getenv(contracts.HubCAFileEnv),
+	)
+	return nil
+}
+
+func ensureEnvFromFile(envKey, path string) bool {
+	if envKey == "" || path == "" {
+		return false
+	}
+	if current := os.Getenv(envKey); current != "" {
+		return true
+	}
+	if info, err := os.Stat(path); err == nil && !info.IsDir() {
+		if err := os.Setenv(envKey, path); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func resolveSecurityMode() (string, bool, error) {
+	raw, ok := os.LookupEnv(contracts.TransportSecurityModeEnv)
+	if !ok {
+		return contracts.TransportSecurityModeTLS, false, nil
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return contracts.TransportSecurityModeTLS, true, nil
+	}
+
+	switch strings.ToLower(raw) {
+	case contracts.TransportSecurityModeTLS:
+		return contracts.TransportSecurityModeTLS, true, nil
+	default:
+		return "", true, fmt.Errorf(
+			"invalid %s value %q: must be %q",
+			contracts.TransportSecurityModeEnv,
+			raw,
+			contracts.TransportSecurityModeTLS,
+		)
+	}
+}
+
+func applyHubEnvFromConfig(logger logr.Logger, cfg *config.OperatorConfig) error {
+	if cfg == nil {
+		return nil
+	}
+	hubCfg := cfg.Hub
+
+	if err := applyHubIntEnv(
+		logger,
+		contracts.HubBufferMaxMessagesEnv,
+		"hub buffer max messages derived from operator config",
+		hubCfg.BufferMaxMessages,
+	); err != nil {
+		return err
+	}
+	if err := applyHubIntEnv(
+		logger,
+		contracts.HubBufferMaxBytesEnv,
+		"hub buffer max bytes derived from operator config",
+		hubCfg.BufferMaxBytes,
+	); err != nil {
+		return err
+	}
+	if err := applyHubDurationEnv(
+		logger,
+		contracts.HubBufferEvictionTTLEnv,
+		"hub buffer TTL derived from operator config",
+		hubCfg.BufferEvictionTTL,
+	); err != nil {
+		return err
+	}
+	if err := applyHubDurationEnv(
+		logger,
+		contracts.HubBufferEvictionIntervalEnv,
+		"hub buffer eviction interval derived from operator config",
+		hubCfg.BufferEvictionPeriod,
+	); err != nil {
+		return err
+	}
+	if err := applyHubIntEnv(
+		logger,
+		contracts.GRPCChannelBufferSizeEnv,
+		"hub channel buffer size derived from operator config",
+		hubCfg.ChannelBufferSize,
+	); err != nil {
+		return err
+	}
+	if err := applyHubDurationEnv(
+		logger,
+		contracts.HubPerMessageTimeoutEnv,
+		"hub per-message timeout derived from operator config",
+		hubCfg.PerMessageTimeout,
+	); err != nil {
+		return err
+	}
+	if err := applyHubIntEnv(
+		logger,
+		contracts.HubMaxActiveStreamsEnv,
+		"hub max active streams derived from operator config",
+		hubCfg.MaxActiveStreams,
+	); err != nil {
+		return err
+	}
+	if err := applyHubIntEnv(
+		logger,
+		contracts.HubMaxBuffersEnv,
+		"hub max buffers derived from operator config",
+		hubCfg.MaxBuffers,
+	); err != nil {
+		return err
+	}
+	if err := applyHubIntEnv(
+		logger,
+		contracts.HubMaxDownstreamsEnv,
+		"hub max downstreams hard cap derived from operator config",
+		hubCfg.MaxDownstreamsHardCap,
+	); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func applyHubIntEnv(logger logr.Logger, envKey, message string, value int) error {
+	set, err := setIntEnvIfUnset(envKey, value)
+	if err != nil {
+		return fmt.Errorf("set %s: %w", envKey, err)
+	}
+	if set {
+		logger.Info(message, "env", envKey, "value", value)
+	}
+	return nil
+}
+
+func applyHubDurationEnv(logger logr.Logger, envKey, message string, value time.Duration) error {
+	set, err := setDurationEnvIfUnset(envKey, value)
+	if err != nil {
+		return fmt.Errorf("set %s: %w", envKey, err)
+	}
+	if set {
+		logger.Info(message, "env", envKey, "value", value)
+	}
+	return nil
+}
+
+// setIntEnvIfUnset writes env to strconv.Itoa(value) when value > 0 and the key
+// is unset, returning true when it changed and surfacing os.Setenv failures so
+// callers can abort startup.
+func setIntEnvIfUnset(env string, value int) (bool, error) {
+	if env == "" {
+		setupLog.Info("skipping env override because key is empty")
+		return false, nil
+	}
+	if value <= 0 {
+		setupLog.Info("skipping env override because value is non-positive", "env", env, "value", value)
+		return false, nil
+	}
+	if existing, exists := os.LookupEnv(env); exists {
+		setupLog.Info("skipping env override because env already set", "env", env, "current", existing)
+		return false, nil
+	}
+	if err := os.Setenv(env, strconv.Itoa(value)); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// setDurationEnvIfUnset writes env to value.String() when value > 0 and the key
+// is unset, returning true when it updated the environment and propagating any
+// os.Setenv failure.
+func setDurationEnvIfUnset(env string, value time.Duration) (bool, error) {
+	if env == "" {
+		setupLog.Info("skipping duration env override because key is empty")
+		return false, nil
+	}
+	if value <= 0 {
+		setupLog.Info("skipping duration env override because value is non-positive", "env", env, "value", value)
+		return false, nil
+	}
+	if existing, exists := os.LookupEnv(env); exists {
+		setupLog.Info("skipping duration env override because env already set", "env", env, "current", existing)
+		return false, nil
+	}
+	if err := os.Setenv(env, value.String()); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func setupConnectorWebhook(mgr ctrl.Manager, image string, policy corev1.PullPolicy) error {
+	if os.Getenv("ENABLE_WEBHOOKS") == "false" {
+		setupLog.Info("connector webhook disabled because ENABLE_WEBHOOKS=false")
+		return nil
+	}
+	if image == "" {
+		setupLog.Info("connector webhook skipped because connector-image is empty")
+		return nil
+	}
+	webhook := podwebhook.NewConnectorWebhook(mgr.GetClient(), image, policy)
+	return webhook.SetupWithManager(mgr)
+}
+
+// shouldInferConnectorImage returns true when the configured connector image is
+// blank or still set to the default value, signalling that main should
+// copy the manager's image instead.
+func shouldInferConnectorImage(current string) bool {
+	trimmed := strings.TrimSpace(current)
+	if trimmed == "" {
+		return true
+	}
+	return trimmed == config.DefaultConnectorImage
+}
+
+func inferConnectorImage(ctx context.Context, reader crclient.Reader) (string, error) {
+	podName := strings.TrimSpace(os.Getenv("POD_NAME"))
+	podNamespace := strings.TrimSpace(os.Getenv("POD_NAMESPACE"))
+	if podName == "" || podNamespace == "" {
+		return "", fmt.Errorf("POD_NAME and POD_NAMESPACE must be set to infer connector image")
+	}
+
+	var pod corev1.Pod
+	if err := reader.Get(ctx, types.NamespacedName{Name: podName, Namespace: podNamespace}, &pod); err != nil {
+		return "", fmt.Errorf("fetch manager pod %s/%s: %w", podNamespace, podName, err)
+	}
+
+	for _, container := range pod.Spec.Containers {
+		if container.Name == managerContainerName {
+			image := strings.TrimSpace(container.Image)
+			if image == "" {
+				return "", fmt.Errorf("manager container image is empty on pod %s/%s", podNamespace, podName)
+			}
+			return image, nil
+		}
+	}
+
+	return "", fmt.Errorf("manager container %q not found on pod %s/%s", managerContainerName, podNamespace, podName)
+}
+
+func debugLoggingEnabled() bool {
+	raw := strings.TrimSpace(os.Getenv(contracts.DebugEnv))
+	if raw == "" {
+		return false
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "t", "yes", "y", "on", "debug":
+		return true
+	default:
+		return false
 	}
 }

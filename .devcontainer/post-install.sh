@@ -47,10 +47,20 @@ echo "------------------------------------"
 echo "Installing development tools..."
 echo "------------------------------------"
 
+KIND_VERSION="v0.31.0"
+KUBEBUILDER_VERSION="v4.10.0"
+KUBECTL_VERSION="v1.35.0"
+HELM_VERSION="v3.19.2"
+WORK_DIR="$(mktemp -d)"
+trap 'rm -rf "${WORK_DIR}"' EXIT
+
+# TODO(supply-chain): Add SHA256 checksum verification for downloaded binaries.
+# Example: echo "<sha256>  /usr/local/bin/kind" | sha256sum -c
+
 # Install kind
 if ! command -v kind &> /dev/null; then
   echo "Installing kind..."
-  curl -Lo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/latest/kind-linux-${ARCH}"
+  curl -Lo /usr/local/bin/kind "https://kind.sigs.k8s.io/dl/${KIND_VERSION}/kind-linux-${ARCH}"
   chmod +x /usr/local/bin/kind
   echo "kind installed successfully"
 fi
@@ -67,7 +77,7 @@ fi
 # Install kubebuilder
 if ! command -v kubebuilder &> /dev/null; then
   echo "Installing kubebuilder..."
-  curl -Lo /usr/local/bin/kubebuilder "https://go.kubebuilder.io/dl/latest/linux/${ARCH}"
+  curl -Lo /usr/local/bin/kubebuilder "https://go.kubebuilder.io/dl/${KUBEBUILDER_VERSION}/linux/${ARCH}"
   chmod +x /usr/local/bin/kubebuilder
   echo "kubebuilder installed successfully"
 fi
@@ -84,10 +94,18 @@ fi
 # Install kubectl
 if ! command -v kubectl &> /dev/null; then
   echo "Installing kubectl..."
-  KUBECTL_VERSION=$(curl -Ls https://dl.k8s.io/release/stable.txt)
   curl -Lo /usr/local/bin/kubectl "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${ARCH}/kubectl"
   chmod +x /usr/local/bin/kubectl
   echo "kubectl installed successfully"
+fi
+
+# Install helm
+if ! command -v helm &> /dev/null; then
+  echo "Installing helm..."
+  curl -Lo "${WORK_DIR}/helm.tar.gz" "https://get.helm.sh/helm-${HELM_VERSION}-linux-${ARCH}.tar.gz"
+  tar -xzf "${WORK_DIR}/helm.tar.gz" -C "${WORK_DIR}"
+  install -m 0755 "${WORK_DIR}/linux-${ARCH}/helm" /usr/local/bin/helm
+  echo "helm installed successfully"
 fi
 
 # Generate kubectl bash completion
@@ -142,6 +160,7 @@ echo "------------------------------------"
 kind version
 kubebuilder version
 kubectl version --client
+helm version
 docker --version
 go version
 

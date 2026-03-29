@@ -1,0 +1,21 @@
+# Health probes can originate from node-local kubelet processes that are not
+# representable through namespace/pod selectors.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  labels:
+    app.kubernetes.io/name: bobravoz-grpc
+    app.kubernetes.io/managed-by: kustomize
+  name: allow-health-probe-traffic
+  namespace: system
+spec:
+  podSelector:
+    matchLabels:
+      control-plane: controller-manager
+      app.kubernetes.io/name: bobravoz-grpc
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8081
+          protocol: TCP

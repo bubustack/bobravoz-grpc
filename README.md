@@ -1,125 +1,168 @@
-# bobravoz-grpc
-// TODO(user): Add simple overview of use/purpose
+# 🔌 bobravoz-grpc — The pluggable gRPC transport hub for bobrapet
+[![Go Reference](https://pkg.go.dev/badge/github.com/bubustack/bobravoz-grpc.svg)](https://pkg.go.dev/github.com/bubustack/bobravoz-grpc)
+[![Go Report Card](https://goreportcard.com/badge/github.com/bubustack/bobravoz-grpc)](https://goreportcard.com/report/github.com/bubustack/bobravoz-grpc)
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
-
-## Getting Started
+`bobravoz-grpc` is a specialized, high-performance transport operator for [bobrapet](https://github.com/bubustack/bobrapet), designed to enable real-time, streaming AI and data workflows on Kubernetes. It acts as an intelligent transport hub, dynamically configuring gRPC connections and performing in-flight data processing for `bobrapet`'s `realtime` stories.
 
 ### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+- Go 1.25.3 or newer (matching `go.mod`)
+- Docker or another OCI-compatible image builder
+- `kubectl`
+- Access to a Kubernetes cluster supported by the current `bobrapet` / `bobravoz-grpc` release set
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## 🔗 Quick Links
 
-```sh
-make docker-build docker-push IMG=<some-registry>/bobravoz-grpc:tag
+- Streaming contract: https://bubustack.io/docs/streaming/streaming-contract
+- Transport settings: https://bubustack.io/docs/streaming/transport-settings
+
+## 🌟 Key Features
+
+- **Intelligent Transport Topologies**: Automatically analyzes `Story` definitions to configure the optimal connection pattern:
+  - **Peer-to-Peer (P2P)**: For maximum throughput, engrams are connected directly when no intermediate processing is required.
+  - **Hub-and-Spoke**: For complex workflows, data is routed through the operator's hub to execute `Story` primitives in-flight.
+- **Active Data Plane**: `bobravoz-grpc` is more than a configurator; it's an active data plane component. It runs its own gRPC hub to broker streaming traffic and enforce transport bindings without bloating the controller.
+- **Pluggable by Design**: Built on a flexible `Transport` interface, the operator is architected to support other real-time protocols like NATS or Kafka in the future.
+- **Seamless `bobrapet` Integration**: Natively understands `bobrapet` concepts like the `realtime` story pattern and `PerStory` vs. `PerStoryRun` strategies to ensure correct and efficient transport configuration.
+- **Declarative Configuration**: Select the gRPC transport with the `bobravoz.bubustack.io/transport=grpc` `Story` annotation, then tune delivery and routing through `Story.spec.transports[]`, `TransportBinding`, and transport-level streaming settings.
+
+## 🏗️ Architecture
+
+`bobravoz-grpc` operates on both the Kubernetes control plane and the data plane to provide its functionality.
+
+- **Control Plane**: The `TransportReconciler` watches `StoryRun` resources. When the parent `Story` selects `bobravoz.bubustack.io/transport=grpc`, it analyzes the step graph, resolves the relevant `TransportBinding`, and injects a deterministic `BUBU_TRANSPORT_BINDING` environment variable so SDK sidecars can resolve upstream/downstream peers.
+
+- **Data Plane**: The operator runs an embedded gRPC `Hub Server`. When a `Story` is configured for hub mediation, the reconciler routes Engram traffic through the hub and injects lightweight connectors (from `ghcr.io/bubustack/bobravoz-grpc-connector`) alongside workloads, keeping the controller image lean.
+
+## 🧱 Backpressure Settings
+
+You can tune hub buffering per transport using `Story.spec.transports[].streaming`.
+`Transport.spec.streaming` acts as the default and is overridden by
+story-specific settings.
+
+```yaml
+spec:
+  transports:
+  - name: rt
+    transportRef: livekit-default
+    streaming:
+      backpressure:
+        buffer:
+          maxMessages: 500
+          maxBytes: 10485760
+          dropPolicy: drop_oldest
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+### 🧭 Connection Topologies
 
-**Install the CRDs into the cluster:**
+Depending on your `Story` definition, `bobravoz-grpc` will create one of two connection types:
 
-```sh
-make install
+1.  **Peer-to-Peer (P2P)**: Simple, direct connection for maximum performance.
+    *Story Definition:*
+    ```yaml
+    steps:
+      - name: step-a
+        ref: { name: engram-a }
+      - name: step-b
+        ref: { name: engram-b }
+    ```
+    *Resulting Topology:*
+    `Engram A <--- gRPC ---> Engram B`
+
+2.  **Hub-and-Spoke**: Data is routed through the operator for mediation.
+    *Story Definition:*
+    ```yaml
+    steps:
+      - name: step-a
+        ref: { name: engram-a }
+      - name: step-b
+        ref: { name: engram-b }
+    ```
+    *Resulting Topology:*
+    `Engram A --- gRPC --> bobravoz-hub --- gRPC --> Engram B`
+
+## 🚀 Quick Start
+
+Using `bobravoz-grpc` requires an existing `bobrapet` installation.
+
+### 1. Install `bobrapet` first
+
+`bobravoz-grpc` does not own the `Transport` / `TransportBinding` CRDs. Those
+APIs ship with `bobrapet`, so install `bobrapet` first and make sure the
+cluster already has the required CRDs and supporting controllers.
+
+### 2. Deploy the transport operator
+
+Deploy the operator controller to your cluster:
+```bash
+make deploy IMG=<your-repo>/bobravoz-grpc:<tag>
 ```
+*(Replace `<your-repo>` and `<tag>` with your container registry and published version.)*
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+If you maintain your own images, build and push both the controller and connector artifacts:
+```bash
+# Controller / manager
+make docker-build IMG=<your-repo>/bobravoz-grpc:<tag>
+make docker-push IMG=<your-repo>/bobravoz-grpc:<tag>
 
-```sh
-make deploy IMG=<some-registry>/bobravoz-grpc:tag
+# Connector sidecar
+make docker-build-connector CONNECTOR_IMG=<your-repo>/bobravoz-connector:<tag>
+make docker-push-connector CONNECTOR_IMG=<your-repo>/bobravoz-connector:<tag>
 ```
+Helm chart consumers can then override `image.repository` / `image.tag` and
+`connectorImage.repository` / `connectorImage.tag` to point at the published
+tags. Connector image settings can also come from the operator ConfigMap
+(`connector.image` and `connector.image-pull-policy`), but explicit manager
+flags or `CONNECTOR_IMAGE` / `CONNECTOR_IMAGE_PULL_POLICY` environment
+variables take precedence over the ConfigMap.
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+## 🛠️ Local Development
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+1.  **Clone and build:**
+    ```bash
+    git clone https://github.com/bubustack/bobravoz-grpc.git
+    cd bobravoz-grpc
+    make build
+    ```
 
-```sh
-kubectl apply -k config/samples/
-```
+2.  **Run the controller locally:**
+    This command runs the operator on your machine, using your local `kubeconfig` to communicate with the cluster. This is great for rapid development and debugging.
+    ```bash
+    make run
+    ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+3.  **Run tests:**
+    ```bash
+    make test
+    ```
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+4.  **End-to-end tests (Kind optional):**
+    ```bash
+    make test-e2e
+    ```
 
-```sh
-kubectl delete -k config/samples/
-```
+5.  **Generate the Helm chart (writes to `dist/charts/`):**
+    ```bash
+    make helm-chart
+    # override chart name if needed
+    make helm-chart CHART=my-custom-name
+    ```
+    The opinionated `Chart.yaml` and `values.yaml` live beneath `hack/charts/<chart>/`; edit
+    those files to change defaults or ecosystem metadata.
 
-**Delete the APIs(CRDs) from the cluster:**
+## 📢 Support, Security, and Changelog
 
-```sh
-make uninstall
-```
+- See [`SUPPORT.md`](./SUPPORT.md) for how to get help and report issues.
+- See [`SECURITY.md`](./SECURITY.md) for vulnerability reporting and security posture.
+- See [`CHANGELOG.md`](./CHANGELOG.md) for the release-please managed version history.
 
-**UnDeploy the controller from the cluster:**
+## 🤝 Community
 
-```sh
-make undeploy
-```
+- Code of Conduct: see [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) (Contributor Covenant v3.0)
+- Discord: https://discord.gg/dysrB7D8H6
 
-## Project Distribution
+## 📄 License
 
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/bobravoz-grpc:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/bobravoz-grpc/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
+Copyright 2025 BubuStack.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -132,4 +175,3 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-

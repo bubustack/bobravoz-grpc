@@ -1,0 +1,24 @@
+# Build the connector binary
+# TODO(supply-chain): Pin base images to digest for reproducible builds.
+# Example: FROM golang:1.25-bookworm@sha256:<digest>
+FROM golang:1.25-bookworm AS builder
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /workspace
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -a -o connector cmd/connector/main.go
+
+# TODO(supply-chain): Pin base images to digest for reproducible builds.
+# Example: FROM gcr.io/distroless/static:nonroot@sha256:<digest>
+FROM gcr.io/distroless/static:nonroot
+WORKDIR /
+COPY --from=builder /workspace/connector /connector
+USER 65532:65532
+
+ENTRYPOINT ["/connector"]
