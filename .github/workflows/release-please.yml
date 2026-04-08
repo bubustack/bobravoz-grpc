@@ -52,7 +52,7 @@ jobs:
       - name: Extract manager Docker metadata
         if: ${{ steps.release.outputs.release_created }}
         id: meta-manager
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_MANAGER_IMAGE }}
           tags: |
@@ -65,7 +65,7 @@ jobs:
       - name: Extract connector Docker metadata
         if: ${{ steps.release.outputs.release_created }}
         id: meta-connector
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_CONNECTOR_IMAGE }}
           tags: |

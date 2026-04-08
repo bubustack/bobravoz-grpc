@@ -33,7 +33,7 @@ jobs:
 
       - name: Extract manager metadata
         id: meta-manager
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.MANAGER_IMAGE }}
           tags: |
@@ -47,7 +47,7 @@ jobs:
 
       - name: Extract connector metadata
         id: meta-connector
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.CONNECTOR_IMAGE }}
           tags: |
