@@ -60,7 +60,7 @@ jobs:
             type=semver,pattern={{major}}
 
       - name: Build manager image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -71,7 +71,7 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Build connector image (no push)
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.connector
@@ -91,14 +91,14 @@ jobs:
         uses: actions/checkout@v6
 
       - name: Build manager image for scanning
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
           tags: bobravoz-grpc-manager:scan
 
       - name: Build connector image for scanning
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.connector

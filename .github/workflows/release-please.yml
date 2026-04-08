@@ -77,7 +77,7 @@ jobs:
 
       - name: Build and push manager image
         if: ${{ steps.release.outputs.release_created }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -92,7 +92,7 @@ jobs:
 
       - name: Build and push connector image
         if: ${{ steps.release.outputs.release_created }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.connector
