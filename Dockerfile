@@ -1,7 +1,7 @@
 # Build the manager binary
 # TODO(supply-chain): Pin base images to digest for reproducible builds.
-# Example: FROM golang:1.25-bookworm@sha256:<digest>
-FROM golang:1.25-bookworm AS builder
+# Example: FROM golang:1.26-bookworm@sha256:<digest>
+FROM golang:1.26-bookworm AS builder
 ARG TARGETOS
 ARG TARGETARCH
 

@@ -41,7 +41,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 )
@@ -50,7 +50,7 @@ import (
 type GRPCTransport struct {
 	client.Client
 	Log      logr.Logger
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 
 	annotationFailureMu   sync.Mutex
 	annotationFailureLast map[string]time.Time
@@ -73,7 +73,7 @@ func NewGRPCTransport(cli client.Client) *GRPCTransport {
 	}
 }
 
-func (r *GRPCTransport) SetRecorder(recorder record.EventRecorder) {
+func (r *GRPCTransport) SetRecorder(recorder events.EventRecorder) {
 	r.Recorder = recorder
 }
 
@@ -255,9 +255,9 @@ func (r *GRPCTransport) markEngramTransportStatus(ctx context.Context, namespace
 						Name:      engramName,
 						Namespace: namespace,
 					},
-				},
+				}, nil,
 				corev1.EventTypeWarning,
-				eventReasonEngramTransportAnnotationErr,
+				eventReasonEngramTransportAnnotationErr, "Reconcile",
 				"Failed to patch transport readiness annotations for %s/%s: %v",
 				namespace,
 				engramName,

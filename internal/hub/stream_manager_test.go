@@ -107,7 +107,7 @@ func TestSendOrBufferRetriesOnTransientError(t *testing.T) {
 func TestSendOrBufferWithPolicy_DisabledRetryDrops(t *testing.T) {
 	sm := NewStreamManager(nil)
 	ctx := context.Background()
-	policy := &bubuv1alpha1.RetryPolicy{MaxRetries: int32Ptr(0)}
+	policy := &bubuv1alpha1.RetryPolicy{MaxRetries: new(int32)}
 	msg := &transportpb.DataPacket{Metadata: map[string]string{"i": "x"}}
 
 	if ok := sm.SendOrBufferWithPolicy(ctx, "sr", "tenant-a", "step", msg, policy); ok {
@@ -365,10 +365,6 @@ func TestApplyFlowPartitionAcksClearsUnacked(t *testing.T) {
 	if len(partitionB.unacked) != 1 {
 		t.Fatalf("expected 1 unacked for p2, got %d", len(partitionB.unacked))
 	}
-}
-
-func int32Ptr(v int32) *int32 {
-	return &v
 }
 
 func TestRecordSent_SkipsAlreadyAcked(t *testing.T) {

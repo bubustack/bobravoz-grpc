@@ -33,7 +33,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -59,11 +59,11 @@ const (
 type TransportReconciler struct {
 	client.Client
 	Scheme   *runtime.Scheme
-	Recorder record.EventRecorder
+	Recorder events.EventRecorder
 }
 
 type recorderAwareTransport interface {
-	SetRecorder(record.EventRecorder)
+	SetRecorder(events.EventRecorder)
 }
 
 // +kubebuilder:rbac:groups=bubustack.io,resources=stories,verbs=get;list;watch
@@ -107,9 +107,9 @@ func (r *TransportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 			)
 			if r.Recorder != nil {
 				r.Recorder.Eventf(
-					&storyRun,
+					&storyRun, nil,
 					corev1.EventTypeWarning,
-					eventReasonParentStoryMissing,
+					eventReasonParentStoryMissing, "Reconcile",
 					"Parent Story %s/%s missing; skipping transport reconciliation for %s/%s",
 					storyKey.Namespace,
 					storyKey.Name,
@@ -147,9 +147,9 @@ func (r *TransportReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		logger.Error(err, "Failed to get transport for story")
 		if r.Recorder != nil {
 			r.Recorder.Eventf(
-				&storyRun,
+				&storyRun, nil,
 				corev1.EventTypeWarning,
-				eventReasonInvalidTransportAnnotation,
+				eventReasonInvalidTransportAnnotation, "Reconcile",
 				"Transport annotation %s invalid: %v",
 				transport.AnnotationTransport,
 				err,
@@ -244,9 +244,9 @@ func (r *TransportReconciler) reconcileNormal(ctx context.Context, storyRun *run
 		logger.Error(err, "Failed to reconcile transport")
 		if r.Recorder != nil {
 			r.Recorder.Eventf(
-				storyRun,
+				storyRun, nil,
 				corev1.EventTypeWarning,
-				eventReasonTransportReconcileFail,
+				eventReasonTransportReconcileFail, "Reconcile",
 				"Transport %s reconciliation failed for %s/%s: %v",
 				transportType,
 				storyRun.Namespace,
@@ -286,9 +286,9 @@ func (r *TransportReconciler) reconcileNormal(ctx context.Context, storyRun *run
 			message = fmt.Sprintf("%s after waiting %s for bindings", message, bindingPendingFor.Round(time.Millisecond))
 		}
 		r.Recorder.Eventf(
-			storyRun,
+			storyRun, nil,
 			corev1.EventTypeNormal,
-			eventReasonTransportReady,
+			eventReasonTransportReady, "Reconcile",
 			"%s",
 			message,
 		)
@@ -315,9 +315,9 @@ func (r *TransportReconciler) reconcileDelete(ctx context.Context, storyRun *run
 		logger.Error(err, "Failed to cleanup transport", "transport", transportType)
 		if r.Recorder != nil {
 			r.Recorder.Eventf(
-				storyRun,
+				storyRun, nil,
 				corev1.EventTypeWarning,
-				eventReasonTransportCleanupFailed,
+				eventReasonTransportCleanupFailed, "Cleanup",
 				"Transport %s cleanup failed for StoryRun %s/%s: %v",
 				transportType,
 				storyRun.Namespace,
@@ -343,9 +343,9 @@ func (r *TransportReconciler) reconcileDelete(ctx context.Context, storyRun *run
 			cleanedCount,
 		)
 		r.Recorder.Eventf(
-			storyRun,
+			storyRun, nil,
 			corev1.EventTypeNormal,
-			eventReasonTransportCleanupSucceeded,
+			eventReasonTransportCleanupSucceeded, "Cleanup",
 			"%s",
 			message,
 		)
@@ -373,7 +373,7 @@ func setTransportConditions(cm *bobrapetconditions.ConditionManager, conditions 
 // SetupWithManager registers TransportReconciler with controller-runtime so it
 // watches StoryRun resources via the manager's shared client/cache.
 func (r *TransportReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.Recorder = mgr.GetEventRecorderFor("transport-reconciler") //nolint:staticcheck // TODO: migrate to events.EventRecorder API
+	r.Recorder = mgr.GetEventRecorder("transport-reconciler")
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&runsv1alpha1.StoryRun{}).
 		WithEventFilter(storyRunTransportRelevantPredicate()).

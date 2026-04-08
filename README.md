@@ -5,7 +5,7 @@
 `bobravoz-grpc` is a specialized, high-performance transport operator for [bobrapet](https://github.com/bubustack/bobrapet), designed to enable real-time, streaming AI and data workflows on Kubernetes. It acts as an intelligent transport hub, dynamically configuring gRPC connections and performing in-flight data processing for `bobrapet`'s `realtime` stories.
 
 ### Prerequisites
-- Go 1.25.3 or newer (matching `go.mod`)
+- Go 1.26+ (matching `go.mod`)
 - Docker or another OCI-compatible image builder
 - `kubectl`
 - Access to a Kubernetes cluster supported by the current `bobrapet` / `bobravoz-grpc` release set

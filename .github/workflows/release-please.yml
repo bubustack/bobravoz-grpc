@@ -52,7 +52,7 @@ jobs:
       - name: Extract manager Docker metadata
         if: ${{ steps.release.outputs.release_created }}
         id: meta-manager
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_MANAGER_IMAGE }}
           tags: |
@@ -65,7 +65,7 @@ jobs:
       - name: Extract connector Docker metadata
         if: ${{ steps.release.outputs.release_created }}
         id: meta-connector
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.GHCR_CONNECTOR_IMAGE }}
           tags: |
@@ -77,7 +77,7 @@ jobs:
 
       - name: Build and push manager image
         if: ${{ steps.release.outputs.release_created }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
@@ -92,7 +92,7 @@ jobs:
 
       - name: Build and push connector image
         if: ${{ steps.release.outputs.release_created }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile.connector
