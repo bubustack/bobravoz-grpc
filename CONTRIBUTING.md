@@ -38,7 +38,7 @@ Thank you for helping make the transport operator fast, stable, and Kubernetes-n
 
 ### Prerequisites
 
-- Go 1.25.3 or later (matching the module’s `go` directive).
+- Go 1.26+ (matching the module’s `go` directive).
 - Docker or another OCI-compatible builder.
 - `make`, `kubectl`, and a Kubernetes cluster (Kind/Minikube is enough for local testing).
 
@@ -62,10 +62,10 @@ make test-e2e
 
 ### Required Secrets
 
-The `sync-helm-chart` workflow requires a `HELM_CHARTS_TOKEN` secret with
-write access to the `bubustack/helm-charts` repository. This must be configured
-by a repository maintainer. The workflow will fail silently on forks without
-this secret.
+The `sync-helm-chart` job in the release-please workflow requires a
+`HELM_CHARTS_TOKEN` secret with write access to the `bubustack/helm-charts`
+repository. This must be configured by a repository maintainer. The job will
+skip silently on forks without this secret.
 
 ### Commit style & Code of Conduct
 

@@ -75,6 +75,7 @@ type recorderAwareTransport interface {
 // +kubebuilder:rbac:groups=runs.bubustack.io,resources=stepruns,verbs=get;list;watch
 // +kubebuilder:rbac:groups=runs.bubustack.io,resources=stepruns/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=apps,resources=deployments;statefulsets,verbs=get;list;watch;update;patch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch

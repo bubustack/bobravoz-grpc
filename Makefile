@@ -85,8 +85,10 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+	@status=0; \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v || status=$$?; \
+	$(MAKE) cleanup-test-e2e; \
+	exit $$status
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
@@ -126,7 +128,7 @@ docker-push: ## Push docker image with the manager.
 	$(CONTAINER_TOOL) push ${IMG}
 
 .PHONY: docker-build-connector
-docker-build-connector: ## Build docker image with the LiveKit connector.
+docker-build-connector: ## Build docker image with the connector.
 	DOCKER_BUILDKIT=1 $(CONTAINER_TOOL) build -t ${CONNECTOR_IMG} -f Dockerfile.connector .
 
 .PHONY: docker-push-connector
@@ -211,24 +213,17 @@ KUSTOMIZE ?= $(LOCALBIN)/kustomize
 CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
 ENVTEST ?= $(LOCALBIN)/setup-envtest
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint
-GO_VERSION ?= $(shell go env GOVERSION)
-GOLANGCI_LINT_CUSTOM = $(LOCALBIN)/golangci-lint-custom-$(GOLANGCI_LINT_VERSION)-$(GO_VERSION)
 HELMIFY ?= $(LOCALBIN)/helmify
 HELM_SCHEMA ?= $(LOCALBIN)/helm-values-schema-json
 
 ## Tool Versions
+## Tool Versions
 KUSTOMIZE_VERSION ?= v5.8.1
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
 #ENVTEST_VERSION is the version of controller-runtime release branch to fetch the envtest setup script (i.e. release-0.20)
-ENVTEST_VERSION ?= $(shell v='$(call gomodver,sigs.k8s.io/controller-runtime)'; \
-  [ -n "$$v" ] || { echo "Set ENVTEST_VERSION manually (controller-runtime replace has no tag)" >&2; exit 1; }; \
-  printf '%s\n' "$$v" | sed -E 's/^v?([0-9]+)\.([0-9]+).*/release-\1.\2/')
-
+ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')
 #ENVTEST_K8S_VERSION is the version of Kubernetes to use for setting up ENVTEST binaries (i.e. 1.31)
-ENVTEST_K8S_VERSION ?= $(shell v='$(call gomodver,k8s.io/api)'; \
-  [ -n "$$v" ] || { echo "Set ENVTEST_K8S_VERSION manually (k8s.io/api replace has no tag)" >&2; exit 1; }; \
-  printf '%s\n' "$$v" | sed -E 's/^v?[0-9]+\.([0-9]+).*/1.\1/')
-
+ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 GOLANGCI_LINT_VERSION ?= v2.11.4
 HELMIFY_VERSION ?= v0.4.19
 HELM_SCHEMA_VERSION ?= v2.3.1
@@ -256,17 +251,14 @@ $(ENVTEST): $(LOCALBIN)
 	$(call go-install-tool,$(ENVTEST),sigs.k8s.io/controller-runtime/tools/setup-envtest,$(ENVTEST_VERSION))
 
 .PHONY: golangci-lint
-golangci-lint: $(LOCALBIN) ## Download golangci-lint locally if necessary.
+golangci-lint: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
+$(GOLANGCI_LINT): $(LOCALBIN)
 	$(call go-install-tool,$(GOLANGCI_LINT),github.com/golangci/golangci-lint/v2/cmd/golangci-lint,$(GOLANGCI_LINT_VERSION))
-	@if [ -f .custom-gcl.yml ]; then \
-		if [ ! -x "$(GOLANGCI_LINT_CUSTOM)" ] || [ .custom-gcl.yml -nt "$(GOLANGCI_LINT_CUSTOM)" ] || [ "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)" -nt "$(GOLANGCI_LINT_CUSTOM)" ]; then \
-			echo "Building custom golangci-lint with plugins..." && \
-			"$(GOLANGCI_LINT)" custom --destination "$(LOCALBIN)" --name "$$(basename "$(GOLANGCI_LINT_CUSTOM)")"; \
-		fi; \
-		ln -sf "$$(realpath "$(GOLANGCI_LINT_CUSTOM)")" "$(GOLANGCI_LINT)"; \
-	else \
-		ln -sf "$$(realpath "$(GOLANGCI_LINT)-$(GOLANGCI_LINT_VERSION)")" "$(GOLANGCI_LINT)"; \
-	fi
+	@test -f .custom-gcl.yml && { \
+		echo "Building custom golangci-lint with plugins..." && \
+		$(GOLANGCI_LINT) custom --destination $(LOCALBIN) --name golangci-lint-custom && \
+		mv -f $(LOCALBIN)/golangci-lint-custom $(GOLANGCI_LINT); \
+	} || true
 
 .PHONY: helmify
 helmify: $(HELMIFY) ## Download helmify locally if necessary.

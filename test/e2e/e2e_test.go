@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -54,17 +53,30 @@ var _ = Describe("Manager", Ordered, func() {
 	// and deploying the controller.
 	BeforeAll(func() {
 		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		output, err := utils.Run(cmd)
-		if err != nil && !strings.Contains(output, "AlreadyExists") {
-			Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-		}
+		nsManifest := fmt.Sprintf(`apiVersion: v1
+kind: Namespace
+metadata:
+  name: %s
+`, namespace)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		cmd.Stdin = strings.NewReader(nsManifest)
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
 
-		By("labeling the namespace to enforce the restricted security policy")
+		By("labeling the namespace to enforce the restricted security policy and allow metrics")
 		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
+			"pod-security.kubernetes.io/enforce=restricted",
+			"metrics=enabled")
 		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
+		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace")
+
+		By("installing bobrapet CRDs (required dependency)")
+		cmd = exec.Command("bash", "-c",
+			`curl -sSfL https://github.com/bubustack/bobrapet/releases/latest/download/install.yaml `+
+				`| awk 'BEGIN{RS="---\n"; ORS="---\n"} /kind: CustomResourceDefinition/' `+
+				`| kubectl apply --server-side -f -`)
+		_, err = utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred(), "Failed to install bobrapet CRDs")
 
 		By("installing CRDs")
 		cmd = exec.Command("make", "install")
@@ -96,6 +108,11 @@ var _ = Describe("Manager", Ordered, func() {
 		cmd = exec.Command("make", "uninstall")
 		_, _ = utils.Run(cmd)
 
+		By("removing bobrapet CRDs")
+		cmd = exec.Command("bash", "-c",
+			`kubectl get crd -o name | grep bubustack.io | xargs -r kubectl delete --ignore-not-found`)
+		_, _ = utils.Run(cmd)
+
 		By("removing manager namespace")
 		cmd = exec.Command("kubectl", "delete", "ns", namespace)
 		_, _ = utils.Run(cmd)
@@ -106,13 +123,37 @@ var _ = Describe("Manager", Ordered, func() {
 	AfterEach(func() {
 		specReport := CurrentSpecReport()
 		if specReport.Failed() {
+			var cmd *exec.Cmd
+			podName := controllerPodName
+			if podName == "" {
+				cmd = exec.Command("kubectl", "get",
+					"pods", "-l", "control-plane=controller-manager",
+					"-o", "go-template={{ range .items }}"+
+						"{{ if not .metadata.deletionTimestamp }}"+
+						"{{ .metadata.name }}"+
+						"{{ \"\\n\" }}{{ end }}{{ end }}",
+					"-n", namespace,
+				)
+				podOutput, err := utils.Run(cmd)
+				if err == nil {
+					podNames := utils.GetNonEmptyLines(podOutput)
+					if len(podNames) > 0 {
+						podName = podNames[0]
+					}
+				}
+			}
+
 			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+			if podName == "" {
+				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs: skipped (controller pod name not available)\n")
 			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+				cmd = exec.Command("kubectl", "logs", podName, "-n", namespace)
+				controllerLogs, err := utils.Run(cmd)
+				if err == nil {
+					_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
+				} else {
+					_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
+				}
 			}
 
 			By("Fetching Kubernetes events")
@@ -134,12 +175,16 @@ var _ = Describe("Manager", Ordered, func() {
 			}
 
 			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
+			if podName == "" {
+				fmt.Println("Pod description: skipped (controller pod name not available)")
 			} else {
-				fmt.Println("Failed to describe controller pod")
+				cmd = exec.Command("kubectl", "describe", "pod", podName, "-n", namespace)
+				podDescription, err := utils.Run(cmd)
+				if err == nil {
+					fmt.Println("Pod description:\n", podDescription)
+				} else {
+					fmt.Println("Failed to describe controller pod")
+				}
 			}
 		}
 	})
@@ -182,10 +227,21 @@ var _ = Describe("Manager", Ordered, func() {
 
 		It("should ensure the metrics endpoint is serving metrics", func() {
 			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=bobravoz-grpc-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
+			crbManifest := fmt.Sprintf(`apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: %s
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bobravoz-grpc-metrics-reader
+subjects:
+- kind: ServiceAccount
+  name: %s
+  namespace: %s
+`, metricsRoleBindingName, serviceAccountName, namespace)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(crbManifest)
 			_, err := utils.Run(cmd)
 			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
 
@@ -218,6 +274,31 @@ var _ = Describe("Manager", Ordered, func() {
 					"Metrics server not yet started")
 			}
 			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("waiting for the webhook service endpoints to be ready")
+			verifyWebhookEndpointsReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "endpointslices.discovery.k8s.io", "-n", namespace,
+					"-l", "kubernetes.io/service-name=bobravoz-grpc-webhook-service",
+					"-o", "jsonpath={range .items[*]}{range .endpoints[*]}{.addresses[*]}{end}{end}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "Webhook endpoints should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Webhook endpoints not yet ready")
+			}
+			Eventually(verifyWebhookEndpointsReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("verifying the mutating webhook server is ready")
+			verifyMutatingWebhookReady := func(g Gomega) {
+				cmd := exec.Command("kubectl", "get", "mutatingwebhookconfigurations.admissionregistration.k8s.io",
+					"bobravoz-grpc-transport-connector-mutating-webhook-configuration",
+					"-o", "jsonpath={.webhooks[0].clientConfig.caBundle}")
+				output, err := utils.Run(cmd)
+				g.Expect(err).NotTo(HaveOccurred(), "MutatingWebhookConfiguration should exist")
+				g.Expect(output).ShouldNot(BeEmpty(), "Mutating webhook CA bundle not yet injected")
+			}
+			Eventually(verifyMutatingWebhookReady, 3*time.Minute, time.Second).Should(Succeed())
+
+			By("waiting additional time for webhook server to stabilize")
+			time.Sleep(5 * time.Second)
 
 			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
 
@@ -288,9 +369,19 @@ func serviceAccountToken() (string, error) {
 
 	// Temporary file to store the token request
 	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+	tmpFile, err := os.CreateTemp("", secretName+"-")
 	if err != nil {
+		return "", err
+	}
+	tokenRequestFile := tmpFile.Name()
+	defer func() {
+		_ = os.Remove(tokenRequestFile)
+	}()
+	if _, err := tmpFile.Write([]byte(tokenRequestRawString)); err != nil {
+		_ = tmpFile.Close()
+		return "", err
+	}
+	if err := tmpFile.Close(); err != nil {
 		return "", err
 	}
 
@@ -303,12 +394,12 @@ func serviceAccountToken() (string, error) {
 			serviceAccountName,
 		), "-f", tokenRequestFile)
 
-		output, err := cmd.CombinedOutput()
+		output, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred())
 
 		// Parse the JSON output to extract the token
 		var token tokenRequest
-		err = json.Unmarshal(output, &token)
+		err = json.Unmarshal([]byte(output), &token)
 		g.Expect(err).NotTo(HaveOccurred())
 
 		out = token.Status.Token

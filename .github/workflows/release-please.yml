@@ -212,12 +212,12 @@ jobs:
         if: steps.token-check.outputs.available == 'true'
         run: make helm-chart CHART=${{ env.CHART_NAME }}
 
-      - name: Stamp image tags in generated values
+      - name: Stamp image tag in generated values
         if: steps.token-check.outputs.available == 'true'
         run: |
           VERSION="${RELEASE_VERSION#v}"
-          sed -i "s/tag: latest/tag: \"${VERSION}\"/" dist/charts/${CHART_NAME}/values.yaml
-          echo "Stamped values.yaml image tags: ${VERSION}"
+          sed -i "s/tag: .*/tag: \"${VERSION}\"/" dist/charts/${CHART_NAME}/values.yaml
+          echo "Stamped values.yaml image tag: ${VERSION}"
 
       - name: Checkout helm-charts repository
         if: steps.token-check.outputs.available == 'true'
