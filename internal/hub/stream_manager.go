@@ -103,6 +103,7 @@ type streamState struct {
 	paused            bool
 	drainPaused       bool
 	lastCheckpoint    time.Time
+	replayLoading     bool
 	replayLoaded      bool
 	maxInFlight       int
 	handoff           handoffState
@@ -260,11 +261,15 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 		if activeGen > 0 && gen > activeGen {
 			// Higher generation — store as shadow (green) stream.
 			// If a previous shadow exists, replace it (third connector scenario).
+			shadowExists := false
 			if prevEntry, ok := sm.getShadow(key); ok {
+				shadowExists = true
 				prevEntry.stream.Close()
 			}
+			if !shadowExists {
+				sm.activeCount.Add(1)
+			}
 			sm.shadows.Store(key, entry)
-			sm.activeCount.Add(1)
 			state.mu.Lock()
 			state.shadowGeneration = gen
 			state.mu.Unlock()
@@ -281,10 +286,14 @@ func (sm *StreamManager) AddStream(ctx context.Context, storyRunName, storyRunNa
 	}
 
 	// Normal path: replace the active stream.
-	_, hadStream := sm.getStream(key)
+	prevActive, hadStream := sm.getStream(key)
 	sm.streams.Store(key, entry)
 	sm.log.Info("Stream added", "key", key, "generation", gen)
-	sm.activeCount.Add(1)
+	if !hadStream {
+		sm.activeCount.Add(1)
+	} else if prevActive != nil {
+		prevActive.stream.Close()
+	}
 
 	if state != nil {
 		state.mu.Lock()
@@ -1302,11 +1311,11 @@ func (sm *StreamManager) loadCheckpoint(state *streamState) {
 		return
 	}
 	state.mu.Lock()
-	if state.replayLoaded || state.delivery.replay.mode != replayDurable {
+	if state.replayLoaded || state.replayLoading || state.delivery.replay.mode != replayDurable {
 		state.mu.Unlock()
 		return
 	}
-	state.replayLoaded = true
+	state.replayLoading = true
 	path := checkpointPath(state)
 	state.mu.Unlock()
 
@@ -1314,13 +1323,21 @@ func (sm *StreamManager) loadCheckpoint(state *streamState) {
 	defer readCancel()
 	payload, err := sm.storage.ReadBlob(readCtx, path)
 	if err != nil {
+		state.mu.Lock()
+		state.replayLoading = false
+		state.mu.Unlock()
 		return
 	}
 	var checkpoint replayCheckpoint
 	if err := json.Unmarshal(payload, &checkpoint); err != nil {
+		state.mu.Lock()
+		state.replayLoading = false
+		state.mu.Unlock()
 		return
 	}
 	state.mu.Lock()
+	state.replayLoading = false
+	state.replayLoaded = true
 	defer state.mu.Unlock()
 	if state.delivery.replay.retention > 0 && time.Since(checkpoint.UpdatedAt) > state.delivery.replay.retention {
 		return

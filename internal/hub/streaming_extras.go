@@ -351,12 +351,6 @@ func extractEventTime(packet *transportpb.DataPacket, source string) (time.Time,
 	if binary := packet.GetBinary(); binary != nil && binary.TimestampMs > 0 {
 		return time.UnixMilli(int64(binary.TimestampMs)), true
 	}
-	fallbackKeys := []string{"event_time_ms", "event-time-ms", "timestamp_ms", "timestamp"}
-	for _, key := range fallbackKeys {
-		if ts, ok := timestampFromMetadata(packet.Metadata, key); ok {
-			return ts, true
-		}
-	}
 	return time.Time{}, false
 }
 

@@ -8,6 +8,15 @@ import (
 	corev1 "k8s.io/api/core/v1"
 )
 
+func mustParseOperatorConfigMap(t *testing.T, cm *corev1.ConfigMap) *OperatorConfig {
+	t.Helper()
+	cfg, err := parseOperatorConfigMap(cm)
+	if err != nil {
+		t.Fatalf("parseOperatorConfigMap returned error: %v", err)
+	}
+	return cfg
+}
+
 func TestOperatorConfigParseHubTunables(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		Data: map[string]string{
@@ -23,7 +32,7 @@ func TestOperatorConfigParseHubTunables(t *testing.T) {
 		},
 	}
 
-	cfg := parseOperatorConfigMap(cm)
+	cfg := mustParseOperatorConfigMap(t, cm)
 	if cfg.Hub.BufferMaxMessages != 123 {
 		t.Fatalf("expected buffer max messages to be 123, got %d", cfg.Hub.BufferMaxMessages)
 	}
@@ -59,22 +68,21 @@ func TestOperatorConfigSecurityModeParsing(t *testing.T) {
 			"hub.transport-security-mode": "tls",
 		},
 	}
-	cfg := parseOperatorConfigMap(cm)
+	cfg := mustParseOperatorConfigMap(t, cm)
 	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
 		t.Fatalf("expected security mode tls, got %s", cfg.Hub.SecurityMode)
 	}
 
 }
 
-func TestOperatorConfigLegacySecurityModeFallsBackToTLS(t *testing.T) {
+func TestOperatorConfigRejectsUnsupportedSecurityMode(t *testing.T) {
 	cm := &corev1.ConfigMap{
 		Data: map[string]string{
 			"hub.transport-security-mode": "plaintext",
 		},
 	}
-	cfg := parseOperatorConfigMap(cm)
-	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
-		t.Fatalf("expected legacy security mode to normalize to tls, got %s", cfg.Hub.SecurityMode)
+	if _, err := parseOperatorConfigMap(cm); err == nil {
+		t.Fatal("expected unsupported security mode to return an error")
 	}
 }
 
@@ -93,7 +101,7 @@ func TestOperatorConfigConnectorFields(t *testing.T) {
 		},
 	}
 
-	cfg := parseOperatorConfigMap(cm)
+	cfg := mustParseOperatorConfigMap(t, cm)
 	if cfg.Connector.Image != "ghcr.io/example/connector:v1" {
 		t.Fatalf("expected connector image to be configured, got %s", cfg.Connector.Image)
 	}
@@ -112,7 +120,7 @@ func TestOperatorConfigHotReload(t *testing.T) {
 		},
 	}
 
-	initialCfg := parseOperatorConfigMap(initialCM)
+	initialCfg := mustParseOperatorConfigMap(t, initialCM)
 	if initialCfg.Hub.BufferMaxMessages != 100 {
 		t.Fatalf("expected initial buffer max messages to be 100, got %d", initialCfg.Hub.BufferMaxMessages)
 	}
@@ -132,7 +140,7 @@ func TestOperatorConfigHotReload(t *testing.T) {
 		},
 	}
 
-	updatedCfg := parseOperatorConfigMap(updatedCM)
+	updatedCfg := mustParseOperatorConfigMap(t, updatedCM)
 	if updatedCfg.Hub.BufferMaxMessages != 200 {
 		t.Fatalf("expected updated buffer max messages to be 200, got %d", updatedCfg.Hub.BufferMaxMessages)
 	}
@@ -160,7 +168,7 @@ func TestOperatorConfigTemplatingHotReload(t *testing.T) {
 		},
 	}
 
-	cfg1 := parseOperatorConfigMap(cm1)
+	cfg1 := mustParseOperatorConfigMap(t, cm1)
 	if cfg1.Templating.EvaluationTimeout != 10*time.Second {
 		t.Fatalf("expected evaluation timeout 10s, got %s", cfg1.Templating.EvaluationTimeout)
 	}
@@ -184,7 +192,7 @@ func TestOperatorConfigTemplatingHotReload(t *testing.T) {
 		},
 	}
 
-	cfg2 := parseOperatorConfigMap(cm2)
+	cfg2 := mustParseOperatorConfigMap(t, cm2)
 	if cfg2.Templating.EvaluationTimeout != 30*time.Second {
 		t.Fatalf("expected updated evaluation timeout 30s, got %s", cfg2.Templating.EvaluationTimeout)
 	}
@@ -199,6 +207,40 @@ func TestOperatorConfigTemplatingHotReload(t *testing.T) {
 	}
 }
 
+func TestOperatorConfigRejectsInvalidEvaluationTimeout(t *testing.T) {
+	defaults := DefaultOperatorConfig()
+
+	tooLow := &corev1.ConfigMap{
+		Data: map[string]string{
+			contracts.KeyTemplatingEvaluationTimeout: "500ms",
+		},
+	}
+	cfg := mustParseOperatorConfigMap(t, tooLow)
+	if cfg.Templating.EvaluationTimeout != defaults.Templating.EvaluationTimeout {
+		t.Fatalf("expected default evaluation timeout %s, got %s", defaults.Templating.EvaluationTimeout, cfg.Templating.EvaluationTimeout)
+	}
+
+	tooHigh := &corev1.ConfigMap{
+		Data: map[string]string{
+			contracts.KeyTemplatingEvaluationTimeout: "90s",
+		},
+	}
+	cfg = mustParseOperatorConfigMap(t, tooHigh)
+	if cfg.Templating.EvaluationTimeout != defaults.Templating.EvaluationTimeout {
+		t.Fatalf("expected default evaluation timeout %s when too high, got %s", defaults.Templating.EvaluationTimeout, cfg.Templating.EvaluationTimeout)
+	}
+
+	valid := &corev1.ConfigMap{
+		Data: map[string]string{
+			contracts.KeyTemplatingEvaluationTimeout: "2s",
+		},
+	}
+	cfg = mustParseOperatorConfigMap(t, valid)
+	if cfg.Templating.EvaluationTimeout != 2*time.Second {
+		t.Fatalf("expected evaluation timeout 2s, got %s", cfg.Templating.EvaluationTimeout)
+	}
+}
+
 func TestOperatorConfigDefersToDefaultsOnInvalidValues(t *testing.T) {
 	// Test that invalid values in ConfigMap result in defaults being used.
 	cm := &corev1.ConfigMap{
@@ -206,13 +248,12 @@ func TestOperatorConfigDefersToDefaultsOnInvalidValues(t *testing.T) {
 			"hub.buffer-max-messages":      "not-a-number",
 			"hub.buffer-max-bytes":         "-100",
 			"hub.buffer-eviction-ttl":      "invalid-duration",
-			"hub.transport-security-mode":  "insecure", // should normalize to TLS
 			"telemetry.trace-propagation":  "not-a-bool",
 			"hub.max-downstreams-hard-cap": "0", // should be ignored (not positive)
 		},
 	}
 
-	cfg := parseOperatorConfigMap(cm)
+	cfg := mustParseOperatorConfigMap(t, cm)
 	defaults := DefaultOperatorConfig()
 
 	// Invalid numeric values should result in defaults.
@@ -224,10 +265,6 @@ func TestOperatorConfigDefersToDefaultsOnInvalidValues(t *testing.T) {
 	}
 	if cfg.Hub.BufferEvictionTTL != defaults.Hub.BufferEvictionTTL {
 		t.Fatalf("expected default eviction TTL %s, got %s", defaults.Hub.BufferEvictionTTL, cfg.Hub.BufferEvictionTTL)
-	}
-	// Security mode should normalize to TLS.
-	if cfg.Hub.SecurityMode != contracts.TransportSecurityModeTLS {
-		t.Fatalf("expected security mode TLS, got %s", cfg.Hub.SecurityMode)
 	}
 	// Invalid bool should result in default.
 	if cfg.Telemetry.TracePropagation != defaults.Telemetry.TracePropagation {

@@ -508,16 +508,6 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	ctx := stream.Context()
 	streamContract := bootstrapruntime.NewContractLogger(s.log, "hub").WithComponent("stream")
 	streamContract.Start("register")
-	// Apply a stream-wide deadline only when upstream didn't supply one.
-	if s.perMessageTimeout > 0 {
-		if _, hasDeadline := ctx.Deadline(); !hasDeadline {
-			var cancel context.CancelFunc
-			ctx, cancel = context.WithTimeout(ctx, s.perMessageTimeout)
-			defer cancel()
-		} else {
-			s.log.V(1).Info("Honoring upstream stream deadline; skipping hub default")
-		}
-	}
 	md, ok := metadata.FromIncomingContext(ctx)
 	if !ok {
 		err := errors.New("missing metadata")
@@ -912,7 +902,7 @@ func (s *Server) releaseLifecycleHook(key string) {
 // contains the given storyrun identifier. Call this when a storyrun's streaming
 // topology is torn down to prevent unbounded map growth.
 func (s *Server) releaseLifecycleHooksForStoryRun(storyRunName, storyRunNamespace string) {
-	prefix := storyRunNamespace + "/" + storyRunName + "/"
+	prefix := storyRunNamespace + "/" + storyRunName + ":"
 	s.hookMu.Lock()
 	defer s.hookMu.Unlock()
 	for key := range s.emittedHooks {

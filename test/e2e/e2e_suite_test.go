@@ -34,7 +34,7 @@ import (
 
 var (
 	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "example.com/bobravoz-grpc:v0.0.1"
+	managerImage = "ghcr.io/bubustack/bobravoz-grpc:v0.3.0"
 	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
 	shouldCleanupCertManager = false
 	// shouldCleanupSharedCA tracks whether the shared CA resources were installed by this suite.

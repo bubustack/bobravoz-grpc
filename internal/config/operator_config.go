@@ -131,7 +131,7 @@ func NewOperatorConfigManager(k8sClient client.Client, namespace, configMapName 
 		ControllerName: "bobravoz-operator-config-manager",
 		DefaultConfig:  DefaultOperatorConfig,
 		ParseConfigMap: func(cm *corev1.ConfigMap) (*OperatorConfig, error) {
-			return parseOperatorConfigMap(cm), nil
+			return parseOperatorConfigMap(cm)
 		},
 		CloneConfig: func(cfg *OperatorConfig) *OperatorConfig {
 			if cfg == nil {
@@ -179,11 +179,12 @@ func (o *OperatorConfigManager) Reconcile(ctx context.Context, req reconcile.Req
 	return o.manager.Reconcile(ctx, req)
 }
 
-func parseOperatorConfigMap(cm *corev1.ConfigMap) *OperatorConfig {
+func parseOperatorConfigMap(cm *corev1.ConfigMap) (*OperatorConfig, error) {
 	cfg := *DefaultOperatorConfig()
-	cfg.Hub.SecurityMode = normalizeSecurityModeValue(cfg.Hub.SecurityMode)
 	data := cm.Data
-	if mode := normalizeSecurityModeValue(data["hub.transport-security-mode"]); mode != "" {
+	if mode, err := parseSecurityModeValue(data["hub.transport-security-mode"]); err != nil {
+		return nil, err
+	} else if mode != "" {
 		cfg.Hub.SecurityMode = mode
 	}
 
@@ -220,7 +221,7 @@ func parseOperatorConfigMap(cm *corev1.ConfigMap) *OperatorConfig {
 		cfg.Connector.ImagePullPolicy = corev1.PullPolicy(strings.TrimSpace(val))
 	}
 	parseTemplatingConfig(cm, &cfg)
-	return &cfg
+	return &cfg, nil
 }
 
 func setPositiveInt(target *int, raw string) {
@@ -264,11 +265,16 @@ func setTrimmedIfPresent(target *string, data map[string]string, key string) {
 
 func parseTemplatingConfig(cm *corev1.ConfigMap, cfg *OperatorConfig) {
 	if val, ok := cm.Data[contracts.KeyTemplatingEvaluationTimeout]; ok {
-		if parsed, err := time.ParseDuration(val); err == nil && parsed >= time.Second && parsed <= 60*time.Second {
+		parsed, err := time.ParseDuration(val)
+		switch {
+		case err != nil:
+			configManagerLog.Info("invalid templating evaluation timeout; keeping default", "raw", val, "error", err.Error())
+		case parsed < time.Second:
+			configManagerLog.Info("templating evaluation timeout below minimum; keeping default", "raw", val)
+		case parsed > 60*time.Second:
+			configManagerLog.Info("templating evaluation timeout above maximum; keeping default", "raw", val)
+		default:
 			cfg.Templating.EvaluationTimeout = parsed
-		} else if parsed >= 0 && parsed < time.Second {
-			configManagerLog.Info("evaluation timeout too low, using minimum 1s", "raw", val)
-			cfg.Templating.EvaluationTimeout = time.Second
 		}
 	}
 	if val, ok := cm.Data[contracts.KeyTemplatingMaxOutputBytes]; ok {
@@ -289,15 +295,19 @@ func parseTemplatingConfig(cm *corev1.ConfigMap, cfg *OperatorConfig) {
 	}
 }
 
-// normalizeSecurityModeValue normalises the transport security mode string.
-// Only "tls" is currently supported; any other value is treated as the default (TLS).
-func normalizeSecurityModeValue(raw string) string { //nolint:unparam // called with different values from config and defaults
-	if strings.EqualFold(strings.TrimSpace(raw), contracts.TransportSecurityModeTLS) {
-		return contracts.TransportSecurityModeTLS
+// parseSecurityModeValue validates the configured transport security mode.
+// Only "tls" is supported; blank values keep the existing default.
+func parseSecurityModeValue(raw string) (string, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return "", nil
 	}
-	// TLS is the only supported mode. Log if a non-empty unsupported value was provided.
-	if trimmed := strings.TrimSpace(raw); trimmed != "" && !strings.EqualFold(trimmed, contracts.TransportSecurityModeTLS) {
-		configManagerLog.Info("unsupported transport security mode, defaulting to TLS", "raw", trimmed)
+	if strings.EqualFold(trimmed, contracts.TransportSecurityModeTLS) {
+		return contracts.TransportSecurityModeTLS, nil
 	}
-	return contracts.TransportSecurityModeTLS
+	return "", fmt.Errorf(
+		"invalid hub.transport-security-mode %q: only %q is supported",
+		trimmed,
+		contracts.TransportSecurityModeTLS,
+	)
 }

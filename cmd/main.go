@@ -293,7 +293,11 @@ func main() {
 	}
 	cancel()
 
+	// Startup snapshot only: runtime config changes are not plumbed yet.
 	cfg := operatorConfigManager.GetConfig()
+	setupLog.Info("operator configuration loaded (startup snapshot only; restart required for config changes)",
+		"configNamespace", operatorConfigNamespace,
+		"configName", operatorConfigName)
 	templateCfg := templating.Config{
 		EvaluationTimeout: cfg.Templating.EvaluationTimeout,
 		MaxOutputBytes:    cfg.Templating.MaxOutputBytes,
@@ -689,15 +693,10 @@ func setupConnectorWebhook(mgr ctrl.Manager, image string, policy corev1.PullPol
 	return webhook.SetupWithManager(mgr)
 }
 
-// shouldInferConnectorImage returns true when the configured connector image is
-// blank or still set to the default value, signalling that main should
-// copy the manager's image instead.
+// shouldInferConnectorImage returns true only when the configured connector
+// image is blank, signalling that main should copy the manager's image.
 func shouldInferConnectorImage(current string) bool {
-	trimmed := strings.TrimSpace(current)
-	if trimmed == "" {
-		return true
-	}
-	return trimmed == config.DefaultConnectorImage
+	return strings.TrimSpace(current) == ""
 }
 
 func inferConnectorImage(ctx context.Context, reader crclient.Reader) (string, error) {

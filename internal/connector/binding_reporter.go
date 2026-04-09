@@ -263,28 +263,30 @@ func (r *bindingStatusReporter) applyObservation(ctx context.Context, obs capabi
 		return nil
 	}
 
-	r.stateMu.Lock()
+	r.stateMu.RLock()
+	current := r.state.clone()
+	r.stateMu.RUnlock()
+
+	desired := current.clone()
 	changed := false
 	audioChanged := false
 	videoChanged := false
 	binaryChanged := false
-	if obs.audio != nil && !audioCodecEqual(r.state.audio, obs.audio) {
-		r.state.audio = cloneAudioCodec(obs.audio)
+	if obs.audio != nil && !audioCodecEqual(current.audio, obs.audio) {
+		desired.audio = cloneAudioCodec(obs.audio)
 		changed = true
 		audioChanged = true
 	}
-	if obs.video != nil && !videoCodecEqual(r.state.video, obs.video) {
-		r.state.video = cloneVideoCodec(obs.video)
+	if obs.video != nil && !videoCodecEqual(current.video, obs.video) {
+		desired.video = cloneVideoCodec(obs.video)
 		changed = true
 		videoChanged = true
 	}
-	if obs.binary != "" && !strings.EqualFold(strings.TrimSpace(r.state.binary), strings.TrimSpace(obs.binary)) {
-		r.state.binary = strings.TrimSpace(obs.binary)
+	if obs.binary != "" && !strings.EqualFold(strings.TrimSpace(current.binary), strings.TrimSpace(obs.binary)) {
+		desired.binary = strings.TrimSpace(obs.binary)
 		changed = true
 		binaryChanged = true
 	}
-	state := r.state.clone()
-	r.stateMu.Unlock()
 
 	if !changed {
 		metrics.RecordConnectorObservationSkip(r.key.Namespace, r.key.Name, "duplicate")
@@ -296,14 +298,15 @@ func (r *bindingStatusReporter) applyObservation(ctx context.Context, obs capabi
 		"videoChanged", videoChanged,
 		"binaryChanged", binaryChanged,
 	)
-	if err := r.patchState(ctx, state); err != nil {
+	if err := r.patchState(ctx, desired); err != nil {
 		metrics.RecordConnectorPatchFailure(r.key.Namespace, r.key.Name)
 		recordCapabilityFieldEvents(r.key.Namespace, r.key.Name, audioChanged, videoChanged, binaryChanged, "failure")
 		return err
 	}
 	metrics.RecordConnectorPatchSuccess(r.key.Namespace, r.key.Name)
 	recordCapabilityFieldEvents(r.key.Namespace, r.key.Name, audioChanged, videoChanged, binaryChanged, "success")
-	r.notifyListeners(state)
+	r.setState(desired)
+	r.notifyListeners(desired)
 	return nil
 }
 

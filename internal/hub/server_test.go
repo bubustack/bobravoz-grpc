@@ -1646,7 +1646,7 @@ func TestServer_Process_OffloadedInjectRoutesToMaterialize(t *testing.T) {
 	require.Equal(t, "materialize", buf.messages[0].GetEnvelope().GetPartition())
 }
 
-func TestServer_Process_PerMessageTimeout(t *testing.T) {
+func TestServer_Process_NoStreamDeadlineFromPerMessageTimeout(t *testing.T) {
 	s := newTestServer(t)
 	s.perMessageTimeout = 15 * time.Millisecond
 
@@ -1670,10 +1670,7 @@ func TestServer_Process_PerMessageTimeout(t *testing.T) {
 
 	err := s.Process(stream)
 
-	require.Error(t, err)
-	st, ok := status.FromError(err)
-	require.True(t, ok)
-	assert.Equal(t, codes.DeadlineExceeded, st.Code())
+	require.NoError(t, err)
 }
 
 func TestGenerateStepRunNameWithinLimit(t *testing.T) {
