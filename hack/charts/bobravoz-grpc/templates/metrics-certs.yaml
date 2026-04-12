@@ -1,0 +1,17 @@
+{{- $sharedCAIssuerName := .Values.sharedCAIssuerName | default "bobrapet-shared-ca" -}}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "bobravoz-grpc.fullname" . }}-metrics-certs
+  labels:
+  {{- include "bobravoz-grpc.labels" . | nindent 4 }}
+spec:
+  dnsNames:
+  - '{{ include "bobravoz-grpc.fullname" . }}-metrics-service.{{ .Release.Namespace }}.svc'
+  - '{{ include "bobravoz-grpc.fullname" . }}-metrics-service.{{ .Release.Namespace }}.svc.{{ .Values.kubernetesClusterDomain }}'
+  issuerRef:
+    kind: ClusterIssuer
+    name: {{ $sharedCAIssuerName | quote }}
+  privateKey:
+    rotationPolicy: Always
+  secretName: {{ include "bobravoz-grpc.fullname" . }}-metrics-server-cert

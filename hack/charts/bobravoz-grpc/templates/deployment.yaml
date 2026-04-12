@@ -1,0 +1,123 @@
+{{- $managerImageTag := .Values.controllerManager.manager.image.tag | default "" -}}
+{{- $defaultConnectorImage := "ghcr.io/bubustack/bobravoz-grpc-connector:latest" -}}
+{{- $connectorImage := .Values.controllerManager.manager.env.connectorImage | default $defaultConnectorImage -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "bobravoz-grpc.fullname" . }}-controller-manager
+  labels:
+    control-plane: controller-manager
+  {{- include "bobravoz-grpc.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.controllerManager.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bobravoz-grpc
+      control-plane: controller-manager
+    {{- include "bobravoz-grpc.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bobravoz-grpc
+        control-plane: controller-manager
+      {{- include "bobravoz-grpc.selectorLabels" . | nindent 8 }}
+      annotations:
+        kubectl.kubernetes.io/default-container: manager
+    spec:
+      containers:
+      - args:
+{{- range $arg := .Values.controllerManager.manager.args }}
+{{- if eq $arg "--config-namespace=bobrapet-system" }}
+        - --config-namespace={{ $.Release.Namespace }}
+{{- else if eq $arg "--config-name=bobravoz-grpc-operator-config" }}
+        - --config-name={{ include "bobravoz-grpc.fullname" $ }}-operator-config
+{{- else }}
+        - {{ $arg }}
+{{- end }}
+{{- end }}
+        command:
+        - /manager
+        env:
+        - name: BUBU_HUB_SERVICE_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: BUBU_HUB_SERVICE_NAME
+          value: {{ quote .Values.controllerManager.manager.env.bubuHubServiceName }}
+        - name: CONNECTOR_IMAGE
+          value: {{ if eq $connectorImage $defaultConnectorImage }}{{ printf "ghcr.io/bubustack/bobravoz-grpc-connector:%s" .Chart.AppVersion | quote }}{{ else }}{{ $connectorImage | quote }}{{ end }}
+        - name: CONNECTOR_IMAGE_PULL_POLICY
+          value: {{ quote .Values.controllerManager.manager.env.connectorImagePullPolicy
+            }}
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+        - name: KUBERNETES_CLUSTER_DOMAIN
+          value: {{ quote .Values.kubernetesClusterDomain }}
+        image: {{ .Values.controllerManager.manager.image.repository }}:{{ if or (eq $managerImageTag "") (eq $managerImageTag "latest") }}{{ .Chart.AppVersion }}{{ else }}{{ $managerImageTag }}{{ end }}
+        imagePullPolicy: {{ .Values.controllerManager.manager.imagePullPolicy }}
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        name: manager
+        ports:
+        - containerPort: 9000
+          name: grpc
+          protocol: TCP
+        - containerPort: 9443
+          name: webhook-server
+          protocol: TCP
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources: {{- toYaml .Values.controllerManager.manager.resources | nindent 10
+          }}
+        securityContext: {{- toYaml .Values.controllerManager.manager.containerSecurityContext
+          | nindent 10 }}
+        volumeMounts:
+        - mountPath: /var/run/hub-tls
+          name: bobravoz-grpc-hub-tls
+          readOnly: true
+        - mountPath: /tmp/k8s-metrics-server/metrics-certs
+          name: bobravoz-grpc-metrics-server-cert
+          readOnly: true
+        - mountPath: /tmp/k8s-webhook-server/serving-certs
+          name: webhook-certs
+          readOnly: true
+      nodeSelector: {{- toYaml .Values.controllerManager.nodeSelector | nindent 8 }}
+      securityContext: {{- toYaml .Values.controllerManager.podSecurityContext | nindent
+        8 }}
+      serviceAccountName: {{ include "bobravoz-grpc.serviceAccountName" . }}
+      terminationGracePeriodSeconds: 10
+      tolerations: {{- toYaml .Values.controllerManager.tolerations | nindent 8 }}
+      topologySpreadConstraints: {{- toYaml .Values.controllerManager.topologySpreadConstraints
+        | nindent 8 }}
+      volumes:
+      - name: bobravoz-grpc-hub-tls
+        secret:
+          secretName: {{ include "bobravoz-grpc.fullname" . }}-hub-tls
+      - name: bobravoz-grpc-metrics-server-cert
+        secret:
+          items:
+          - key: ca.crt
+            path: ca.crt
+          - key: tls.crt
+            path: tls.crt
+          - key: tls.key
+            path: tls.key
+          optional: false
+          secretName: {{ include "bobravoz-grpc.fullname" . }}-metrics-server-cert
+      - name: webhook-certs
+        secret:
+          secretName: {{ include "bobravoz-grpc.fullname" . }}-webhook-server-cert

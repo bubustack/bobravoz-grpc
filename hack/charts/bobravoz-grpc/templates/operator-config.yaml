@@ -1,0 +1,41 @@
+{{- $defaultConnectorImage := "ghcr.io/bubustack/bobravoz-grpc-connector:latest" -}}
+{{- $connectorImage := .Values.operatorConfig.connectorImage | default $defaultConnectorImage -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "bobravoz-grpc.fullname" . }}-operator-config
+  labels:
+  {{- include "bobravoz-grpc.labels" . | nindent 4 }}
+data:
+  connector.image: {{ if eq $connectorImage $defaultConnectorImage }}{{ printf "ghcr.io/bubustack/bobravoz-grpc-connector:%s" .Chart.AppVersion | quote }}{{ else }}{{ $connectorImage | quote }}{{ end }}
+  connector.image-pull-policy: {{ .Values.operatorConfig.connectorImagePullPolicy
+    | quote }}
+  hub.buffer-eviction-interval: {{ .Values.operatorConfig.hubBufferEvictionInterval
+    | quote }}
+  hub.buffer-eviction-ttl: {{ .Values.operatorConfig.hubBufferEvictionTtl | quote
+    }}
+  hub.buffer-max-bytes: {{ .Values.operatorConfig.hubBufferMaxBytes | quote }}
+  hub.buffer-max-messages: {{ .Values.operatorConfig.hubBufferMaxMessages | quote
+    }}
+  hub.channel-buffer-size: {{ .Values.operatorConfig.hubChannelBufferSize | quote
+    }}
+  hub.max-active-streams: {{ .Values.operatorConfig.hubMaxActiveStreams | quote }}
+  hub.max-buffers: {{ .Values.operatorConfig.hubMaxBuffers | quote }}
+  hub.max-downstreams-hard-cap: {{ .Values.operatorConfig.hubMaxDownstreamsHardCap
+    | quote }}
+  hub.per-message-timeout: {{ .Values.operatorConfig.hubPerMessageTimeout | quote
+    }}
+  hub.transport-security-mode: {{ .Values.operatorConfig.hubTransportSecurityMode
+    | quote }}
+  telemetry.trace-propagation: {{ .Values.operatorConfig.telemetryTracePropagation
+    | quote }}
+  templating.deterministic: {{ .Values.operatorConfig.templatingDeterministic | quote
+    }}
+  templating.evaluation-timeout: {{ .Values.operatorConfig.templatingEvaluationTimeout
+    | quote }}
+  templating.materialize-engram: {{ .Values.operatorConfig.templatingMaterializeEngram
+    | quote }}
+  templating.max-output-bytes: {{ .Values.operatorConfig.templatingMaxOutputBytes
+    | quote }}
+  templating.offloaded-data-policy: {{ .Values.operatorConfig.templatingOffloadedDataPolicy
+    | quote }}

@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "bobravoz-grpc.fullname" . }}-metrics-service
+  labels:
+    control-plane: controller-manager
+  {{- include "bobravoz-grpc.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.metricsService.type }}
+  selector:
+    app.kubernetes.io/name: bobravoz-grpc
+    control-plane: controller-manager
+    {{- include "bobravoz-grpc.selectorLabels" . | nindent 4 }}
+  ports:
+  {{- .Values.metricsService.ports | toYaml | nindent 2 }}

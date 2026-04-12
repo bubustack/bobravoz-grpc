@@ -3,6 +3,7 @@ IMG ?= ghcr.io/bubustack/bobravoz-grpc:latest
 CONNECTOR_IMG ?= ghcr.io/bubustack/bobravoz-grpc-connector:latest
 CHART ?= bobravoz-grpc
 CHART_OVERRIDE_DIR ?= hack/charts
+RELEASE_PLEASE_MANIFEST ?= .github/.release-please-manifest.json
 
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
@@ -171,6 +172,16 @@ helm-chart: helmify helm-schema kustomize ## Generate Helm chart via helmify (ov
 	$(KUSTOMIZE) build config/default | $(HELMIFY) -crd-dir dist/charts/$(CHART)
 	if [ -d $(CHART_OVERRIDE_DIR)/$(CHART) ]; then \
 		cp -R $(CHART_OVERRIDE_DIR)/$(CHART)/. dist/charts/$(CHART)/; \
+	fi
+	@if [ -f $(RELEASE_PLEASE_MANIFEST) ]; then \
+		VERSION="$$(awk -F'"' '/"[.]":/ { print $$4 }' $(RELEASE_PLEASE_MANIFEST))"; \
+		if [ -n "$$VERSION" ]; then \
+			sed -i.bak -E "s/^version:.*/version: $$VERSION/" dist/charts/$(CHART)/Chart.yaml; \
+			sed -i.bak -E "s/^appVersion:.*/appVersion: \"$$VERSION\"/" dist/charts/$(CHART)/Chart.yaml; \
+			VERSION="$$VERSION" perl -0pi.bak -e 's/^(\s*tag:).*$$/$$1 "$$ENV{VERSION}"/m' dist/charts/$(CHART)/values.yaml; \
+			VERSION="$$VERSION" perl -0pi.bak -e 's#^(\s*connectorImage:\s+ghcr.io/bubustack/bobravoz-grpc-connector:).*$$#$$1$$ENV{VERSION}#mg' dist/charts/$(CHART)/values.yaml; \
+			rm -f dist/charts/$(CHART)/Chart.yaml.bak dist/charts/$(CHART)/values.yaml.bak; \
+		fi; \
 	fi
 	$(HELM_SCHEMA) -f dist/charts/$(CHART)/values.yaml -o dist/charts/$(CHART)/values.schema.json
 
