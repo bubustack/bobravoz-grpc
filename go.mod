@@ -3,7 +3,7 @@ go 1.26.2
 module github.com/bubustack/bobravoz-grpc
 
 require (
-	github.com/bubustack/bobrapet v0.1.6
+	github.com/bubustack/bobrapet v0.1.7
 	github.com/bubustack/core v0.1.3
 	github.com/bubustack/tractatus v0.1.2
 	github.com/go-logr/logr v1.4.3
