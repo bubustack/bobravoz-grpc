@@ -106,7 +106,7 @@ jobs:
           tags: bobravoz-grpc-connector:scan
 
       - name: Run Trivy vulnerability scanner on manager
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: bobravoz-grpc-manager:scan
           format: 'sarif'
@@ -114,7 +114,7 @@ jobs:
           severity: 'CRITICAL,HIGH'
 
       - name: Run Trivy vulnerability scanner on connector
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@v0.36.0
         with:
           image-ref: bobravoz-grpc-connector:scan
           format: 'sarif'
