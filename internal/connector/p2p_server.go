@@ -84,6 +84,10 @@ func (s *p2pServer) Process(stream transportpb.HubService_ProcessServer) error {
 				errCh <- err
 				return
 			}
+			if err := validateTransportMessage("process request", req); err != nil {
+				errCh <- status.Error(codes.InvalidArgument, err.Error())
+				return
+			}
 
 			if flow := req.GetFlow(); flow != nil {
 				s.log.V(1).Info("P2P received upstream flow control; ignoring")
@@ -288,6 +292,9 @@ func p2pHeartbeatInterval() time.Duration {
 func (s *p2pServer) sendResponse(stream transportpb.HubService_ProcessServer, resp *transportpb.ProcessResponse) error {
 	if s == nil || stream == nil || resp == nil {
 		return nil
+	}
+	if err := validateTransportMessage("process response", resp); err != nil {
+		return err
 	}
 	s.sendMu.Lock()
 	defer s.sendMu.Unlock()

@@ -1,11 +1,18 @@
 package config
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/bubustack/core/contracts"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func mustParseOperatorConfigMap(t *testing.T, cm *corev1.ConfigMap) *OperatorConfig {
@@ -15,6 +22,107 @@ func mustParseOperatorConfigMap(t *testing.T, cm *corev1.ConfigMap) *OperatorCon
 		t.Fatalf("parseOperatorConfigMap returned error: %v", err)
 	}
 	return cfg
+}
+
+func TestOperatorConfigManagerLoadInitialUsesAPIReaderAdapter(t *testing.T) {
+	t.Parallel()
+
+	scheme := testCoreV1Scheme(t)
+	cachedClient := fake.NewClientBuilder().WithScheme(scheme).Build()
+	apiReader := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(testOperatorConfigMap("cfg", map[string]string{
+			"hub.channel-buffer-size": "77",
+		})).
+		Build()
+
+	manager, err := NewOperatorConfigManager(cachedClient, "default", "cfg")
+	if err != nil {
+		t.Fatalf("NewOperatorConfigManager returned error: %v", err)
+	}
+	manager.SetAPIReader(apiReader)
+	if err := manager.LoadInitial(context.Background()); err != nil {
+		t.Fatalf("LoadInitial returned error: %v", err)
+	}
+
+	if got := manager.GetConfig().Hub.ChannelBufferSize; got != 77 {
+		t.Fatalf("expected APIReader config to be loaded, got channel buffer size %d", got)
+	}
+}
+
+func TestOperatorConfigManagerReconcileAdaptsControllerRuntimeRequest(t *testing.T) {
+	t.Parallel()
+
+	scheme := testCoreV1Scheme(t)
+	client := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(testOperatorConfigMap("cfg", map[string]string{
+			"hub.channel-buffer-size": "88",
+		})).
+		Build()
+
+	manager, err := NewOperatorConfigManager(client, "default", "cfg")
+	if err != nil {
+		t.Fatalf("NewOperatorConfigManager returned error: %v", err)
+	}
+	_, err = manager.Reconcile(context.Background(), reconcile.Request{
+		NamespacedName: types.NamespacedName{Namespace: "default", Name: "cfg"},
+	})
+	if err != nil {
+		t.Fatalf("Reconcile returned error: %v", err)
+	}
+
+	if got := manager.GetConfig().Hub.ChannelBufferSize; got != 88 {
+		t.Fatalf("expected reconciled config to be applied, got channel buffer size %d", got)
+	}
+}
+
+func TestOperatorConfigManagerPredicateMatchesConfiguredConfigMap(t *testing.T) {
+	t.Parallel()
+
+	manager, err := NewOperatorConfigManager(fake.NewClientBuilder().WithScheme(testCoreV1Scheme(t)).Build(), "default", "cfg")
+	if err != nil {
+		t.Fatalf("NewOperatorConfigManager returned error: %v", err)
+	}
+	predicate := manager.configMapPredicate()
+	watched := testOperatorConfigMap("cfg", nil)
+	other := testOperatorConfigMap("other", nil)
+
+	if !predicate.Create(event.CreateEvent{Object: watched}) {
+		t.Fatal("expected create event for configured ConfigMap to match")
+	}
+	if !predicate.Update(event.UpdateEvent{ObjectOld: other, ObjectNew: watched}) {
+		t.Fatal("expected update event with configured ConfigMap as new object to match")
+	}
+	if !predicate.Delete(event.DeleteEvent{Object: watched}) {
+		t.Fatal("expected delete event for configured ConfigMap to match")
+	}
+	if predicate.Create(event.CreateEvent{Object: other}) {
+		t.Fatal("expected create event for other ConfigMap to be ignored")
+	}
+	if predicate.Generic(event.GenericEvent{Object: watched}) {
+		t.Fatal("expected generic event to be ignored")
+	}
+}
+
+func testCoreV1Scheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatalf("failed to add corev1 scheme: %v", err)
+	}
+	return scheme
+}
+
+func testOperatorConfigMap(name string, data map[string]string) *corev1.ConfigMap {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      name,
+		},
+		Data: data,
+	}
 }
 
 func TestOperatorConfigParseHubTunables(t *testing.T) {

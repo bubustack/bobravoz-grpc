@@ -22,6 +22,7 @@ import (
 	transportconnector "github.com/bubustack/core/runtime/transport/connector"
 	"github.com/bubustack/tractatus/envelope"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
+	tractatusvalidation "github.com/bubustack/tractatus/validation"
 	"github.com/go-logr/logr"
 	"go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc"
 	"golang.org/x/sync/errgroup"
@@ -57,6 +58,16 @@ type handoffState struct {
 	phase     string
 	reason    string
 	updatedAt time.Time
+}
+
+func validateTransportMessage(kind string, msg proto.Message) error {
+	if msg == nil {
+		return nil
+	}
+	if err := tractatusvalidation.Validate(msg); err != nil {
+		return fmt.Errorf("transport %s invalid: %w", kind, err)
+	}
+	return nil
 }
 
 type runtimeTunables = transportconnector.RuntimeTunables
@@ -384,8 +395,12 @@ func (s *transportServer) Control(stream transportpb.TransportConnectorService_C
 	unregisterWatcher := s.registerWatcher(watcher)
 	defer unregisterWatcher()
 	s.reportReady(ctx)
+	ready := connectorReadyDirective(s.startupCapabilitiesMode())
+	if err := validateTransportMessage("control response", ready); err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
 	if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, "control ready send", func(context.Context) error {
-		return stream.Send(connectorReadyDirective(s.startupCapabilitiesMode()))
+		return stream.Send(ready)
 	}); err != nil {
 		return err
 	}
@@ -473,6 +488,9 @@ func (s *transportServer) dataRecvLoop(ctx context.Context, stream transportpb.T
 		if watcher != nil {
 			watcher.Touch()
 		}
+		if err := validateTransportMessage("data request", req); err != nil {
+			return status.Error(codes.InvalidArgument, err.Error())
+		}
 
 		if !s.gate.AllowUpstream() {
 			continue
@@ -508,6 +526,9 @@ func (s *transportServer) dataSendLoop(ctx context.Context, stream transportpb.T
 			resp := packetToDataResponse(packet)
 			if resp == nil {
 				continue
+			}
+			if err := validateTransportMessage("data response", resp); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
 			}
 			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, "data send", func(context.Context) error {
 				return stream.Send(resp)
@@ -642,15 +663,18 @@ func structuredEnvelopeFromPacket(packet *transportpb.DataPacket) (*envelope.Env
 			if descriptor == nil {
 				continue
 			}
-			var config map[string]any
-			if descriptor.GetConfig() != nil {
-				config = descriptor.GetConfig().AsMap()
+			var typedConfig *envelope.TransportConfig
+			if typed := descriptor.GetTypedConfig(); typed != nil {
+				typedConfig = &envelope.TransportConfig{
+					TransportRef: typed.GetTransportRef(),
+					ModeReason:   typed.GetModeReason(),
+				}
 			}
 			env.Transports = append(env.Transports, envelope.TransportDescriptor{
-				Name:   descriptor.GetName(),
-				Kind:   descriptor.GetKind(),
-				Mode:   descriptor.GetMode(),
-				Config: config,
+				Name:        descriptor.GetName(),
+				Kind:        descriptor.GetKind(),
+				Mode:        descriptor.GetMode(),
+				TypedConfig: typedConfig,
 			})
 		}
 		if len(env.Transports) > 0 {
@@ -676,6 +700,9 @@ func (s *transportServer) forwardCapabilityUpdates(ctx context.Context, stream t
 				return nil
 			}
 			if directive := capabilityStateToDirective(state); directive != nil {
+				if err := validateTransportMessage("control response", directive); err != nil {
+					return status.Error(codes.InvalidArgument, err.Error())
+				}
 				if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, "control capability send", func(context.Context) error {
 					return stream.Send(directive)
 				}); err != nil {
@@ -702,6 +729,9 @@ func (s *transportServer) forwardHandoffUpdates(ctx context.Context, stream tran
 			}
 			if directive == nil {
 				continue
+			}
+			if err := validateTransportMessage("control response", directive); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
 			}
 			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, "control handoff send", func(context.Context) error {
 				return stream.Send(directive)
@@ -737,6 +767,9 @@ func (s *transportServer) consumeControlDirectives(ctx context.Context, stream t
 			return err
 		}
 		if directive != nil {
+			if err := validateTransportMessage("control request", directive); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
+			}
 			s.recordControlDirective("received", controlRequestType(directive))
 			s.log.V(1).Info("Control: received directive", "type", controlRequestType(directive))
 			if watcher != nil {
@@ -745,6 +778,9 @@ func (s *transportServer) consumeControlDirectives(ctx context.Context, stream t
 			}
 		}
 		if resp := s.handleControlDirective(ctx, directive); resp != nil {
+			if err := validateTransportMessage("control response", resp); err != nil {
+				return status.Error(codes.InvalidArgument, err.Error())
+			}
 			if err := transportconnector.CallWithTimeout(ctx, s.tunables.MessageTimeout, "control send resp", func(context.Context) error {
 				return stream.Send(resp)
 			}); err != nil {
@@ -1685,10 +1721,14 @@ func (b *hubBridge) sendPacket(client transportpb.HubService_ProcessClient, pack
 	if client == nil || packet == nil {
 		return fmt.Errorf("hub stream unavailable")
 	}
+	req := &transportpb.ProcessRequest{Packet: packet}
+	if err := validateTransportMessage("process request", req); err != nil {
+		return err
+	}
 	return transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, "hub send", func(context.Context) error {
 		b.sendMu.Lock()
 		defer b.sendMu.Unlock()
-		return client.Send(&transportpb.ProcessRequest{Packet: packet})
+		return client.Send(req)
 	})
 }
 
@@ -1696,10 +1736,14 @@ func (b *hubBridge) sendFlow(client transportpb.HubService_ProcessClient, flow *
 	if client == nil || flow == nil {
 		return fmt.Errorf("hub stream unavailable")
 	}
+	req := &transportpb.ProcessRequest{Flow: flow}
+	if err := validateTransportMessage("process request", req); err != nil {
+		return err
+	}
 	return transportconnector.CallWithTimeout(b.ctx, b.messageTimeout, "hub flow send", func(context.Context) error {
 		b.sendMu.Lock()
 		defer b.sendMu.Unlock()
-		return client.Send(&transportpb.ProcessRequest{Flow: flow})
+		return client.Send(req)
 	})
 }
 

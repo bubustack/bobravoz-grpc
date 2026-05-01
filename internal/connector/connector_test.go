@@ -236,6 +236,65 @@ func (f *blockingDataStream) Context() context.Context     { return f.ctx }
 func (f *blockingDataStream) SendMsg(any) error            { return nil }
 func (f *blockingDataStream) RecvMsg(any) error            { return nil }
 
+type queuedDataStream struct {
+	ctx    context.Context
+	recvCh chan *transportpb.DataRequest
+}
+
+func newQueuedDataStream(ctx context.Context) *queuedDataStream {
+	return &queuedDataStream{
+		ctx:    ctx,
+		recvCh: make(chan *transportpb.DataRequest, 1),
+	}
+}
+
+func (f *queuedDataStream) Send(*transportpb.DataResponse) error {
+	return nil
+}
+
+func (f *queuedDataStream) Recv() (*transportpb.DataRequest, error) {
+	req, ok := <-f.recvCh
+	if !ok {
+		return nil, io.EOF
+	}
+	return req, nil
+}
+
+func (f *queuedDataStream) SetHeader(metadata.MD) error  { return nil }
+func (f *queuedDataStream) SendHeader(metadata.MD) error { return nil }
+func (f *queuedDataStream) SetTrailer(metadata.MD)       {}
+func (f *queuedDataStream) Context() context.Context     { return f.ctx }
+func (f *queuedDataStream) SendMsg(any) error            { return nil }
+func (f *queuedDataStream) RecvMsg(any) error            { return nil }
+
+func TestTransportServerDataRecvLoopRejectsProtoInvalidDataRequest(t *testing.T) {
+	ctx := t.Context()
+	stream := newQueuedDataStream(ctx)
+	transports := make([]*transportpb.TransportDescriptor, 11)
+	for i := range transports {
+		transports[i] = &transportpb.TransportDescriptor{Name: "transport"}
+	}
+	stream.recvCh <- &transportpb.DataRequest{
+		Frame: &transportpb.DataRequest_Binary{
+			Binary: &transportpb.BinaryFrame{
+				Payload:  []byte("payload"),
+				MimeType: "application/octet-stream",
+			},
+		},
+		Transports: transports,
+	}
+	close(stream.recvCh)
+
+	server := &transportServer{
+		log:  logr.Discard(),
+		gate: newMediaGate(),
+	}
+
+	err := server.dataRecvLoop(ctx, stream, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "transport data request invalid")
+}
+
 func TestTransportServerDataSendLoopReturnsOnBlockedSendTimeout(t *testing.T) {
 	ctx := t.Context()
 
@@ -461,4 +520,25 @@ func TestTransportServerHandleControlDirectiveIgnoresLegacyStartupAck(t *testing
 		},
 	})
 	require.Nil(t, resp)
+}
+
+func TestStructuredEnvelopeFromPacketPreservesTypedTransportConfig(t *testing.T) {
+	env, err := structuredEnvelopeFromPacket(&transportpb.DataPacket{
+		Transports: []*transportpb.TransportDescriptor{{
+			Name: "livekit",
+			Kind: "livekit",
+			Mode: "hot",
+			TypedConfig: &transportpb.TransportConfig{
+				TransportRef: "livekit-default",
+				ModeReason:   "streaming-default",
+			},
+		}},
+	})
+
+	require.NoError(t, err)
+	require.NotNil(t, env)
+	require.Len(t, env.Transports, 1)
+	require.NotNil(t, env.Transports[0].TypedConfig)
+	require.Equal(t, "livekit-default", env.Transports[0].TypedConfig.TransportRef)
+	require.Equal(t, "streaming-default", env.Transports[0].TypedConfig.ModeReason)
 }

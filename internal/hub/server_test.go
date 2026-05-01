@@ -35,9 +35,12 @@ import (
 	"github.com/bubustack/bobrapet/pkg/enums"
 	"github.com/bubustack/bobrapet/pkg/refs"
 	"github.com/bubustack/core/contracts"
+	bootstrapruntime "github.com/bubustack/core/runtime/bootstrap"
+	stagemeta "github.com/bubustack/core/runtime/stage"
 	coretransport "github.com/bubustack/core/runtime/transport"
 	"github.com/bubustack/core/templating"
 	transportpb "github.com/bubustack/tractatus/gen/go/proto/transport/v1"
+	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -117,6 +120,41 @@ func newMockStream(ctx context.Context) *mockStream {
 		SentChan: make(chan *transportpb.ProcessResponse, 1),
 		ctx:      ctx,
 	}
+}
+
+func TestMessageLoopRejectsProtoInvalidProcessRequest(t *testing.T) {
+	ctx := t.Context()
+	stream := newMockStream(ctx)
+	transports := make([]*transportpb.TransportDescriptor, 11)
+	for i := range transports {
+		transports[i] = &transportpb.TransportDescriptor{Name: "transport"}
+	}
+	stream.RecvChan <- &transportpb.ProcessRequest{
+		Packet: &transportpb.DataPacket{
+			Frame: &transportpb.DataPacket_Binary{
+				Binary: &transportpb.BinaryFrame{
+					Payload:  []byte("payload"),
+					MimeType: "application/octet-stream",
+				},
+			},
+			Transports: transports,
+		},
+	}
+	close(stream.RecvChan)
+	stream.On("Recv").Return((*transportpb.ProcessRequest)(nil), nil).Once()
+
+	server := &Server{log: logr.Discard()}
+
+	err := server.messageLoop(
+		ctx,
+		stream,
+		stagemeta.Metadata{StoryRun: "storyrun", Namespace: "default", Step: "step"},
+		bootstrapruntime.NewContractLogger(logr.Discard(), "test"),
+	)
+
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Contains(t, err.Error(), "transport process request invalid")
 }
 
 func newTestServer(t *testing.T, objects ...client.Object) *Server {
@@ -2077,6 +2115,47 @@ func TestServer_Process_HotTransportBypassesEvaluation(t *testing.T) {
 		t.Fatal("timed out waiting for hot-path packet")
 	}
 	close(upstreamStream.RecvChan)
+}
+
+func TestCloneTransportsPreservesTypedConfig(t *testing.T) {
+	transports := []*transportpb.TransportDescriptor{{
+		Name: "rt",
+		Kind: "livekit",
+		Mode: "hot",
+		TypedConfig: &transportpb.TransportConfig{
+			TransportRef: "livekit-default",
+			ModeReason:   "streaming-default",
+		},
+	}}
+
+	cloned := cloneTransports(transports)
+	require.Len(t, cloned, 1)
+	require.NotNil(t, cloned[0].GetTypedConfig())
+	require.Equal(t, "livekit-default", cloned[0].GetTypedConfig().GetTransportRef())
+	require.Equal(t, "streaming-default", cloned[0].GetTypedConfig().GetModeReason())
+
+	transports[0].TypedConfig.TransportRef = "mutated"
+	require.Equal(t, "livekit-default", cloned[0].GetTypedConfig().GetTransportRef())
+}
+
+func TestPacketTransportModePrefersTypedConfig(t *testing.T) {
+	story := &bubuv1alpha1.Story{}
+	story.Status.Transports = []bubuv1alpha1.StoryTransportStatus{{
+		Name: "rt",
+		Mode: enums.TransportModeFallback,
+	}}
+	packet := &transportpb.DataPacket{
+		Transports: []*transportpb.TransportDescriptor{{
+			Name: "rt",
+			TypedConfig: &transportpb.TransportConfig{
+				TransportRef: "livekit-default",
+				ModeReason:   "streaming-default",
+			},
+			Mode: "hot",
+		}},
+	}
+
+	require.True(t, isHotTransportForPacket(story, packet, "rt"))
 }
 
 func TestProcessPacket_HotTransportBypassesEvaluationAfterParallel(t *testing.T) {

@@ -985,6 +985,10 @@ func (s *Server) messageLoop(ctx context.Context, stream transportpb.HubService_
 				err = result.err
 				return err
 			}
+			if err := validateTransportMessage("process request", result.req); err != nil {
+				meta.Error(s.log, err, "Invalid transport process request")
+				return status.Error(codes.InvalidArgument, err.Error())
+			}
 
 			if flow := result.req.GetFlow(); flow != nil {
 				s.streamManager.ApplyFlow(meta.StoryRun, meta.Namespace, meta.Step, flow)
@@ -1074,7 +1078,7 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 	}
 	currentStep := &story.Spec.Steps[sourceIndex]
 	currentTransport := currentStep.Transport
-	hotTransport := isHotTransport(story, currentTransport)
+	hotTransport := isHotTransportForPacket(story, in, currentTransport)
 
 	routingPolicy := resolveRoutingPolicyForStep(ctx, s.client, story, currentStep)
 	routingPolicy = s.clampMaxDownstreams(routingPolicy)
@@ -3031,6 +3035,37 @@ func isHotTransport(story *bubuv1alpha1.Story, transportName string) bool {
 		return mode == enums.TransportModeHot
 	}
 	return false
+}
+
+func isHotTransportForPacket(story *bubuv1alpha1.Story, packet *transportpb.DataPacket, transportName string) bool {
+	if mode, ok := packetTransportMode(packet, transportName); ok {
+		return mode == string(enums.TransportModeHot)
+	}
+	return isHotTransport(story, transportName)
+}
+
+func packetTransportMode(packet *transportpb.DataPacket, transportName string) (string, bool) {
+	if packet == nil || transportName == "" {
+		return "", false
+	}
+	for _, descriptor := range packet.GetTransports() {
+		if descriptor == nil || descriptor.GetName() != transportName {
+			continue
+		}
+		typed := descriptor.GetTypedConfig()
+		if typed == nil {
+			continue
+		}
+		if strings.TrimSpace(typed.GetTransportRef()) == "" && strings.TrimSpace(typed.GetModeReason()) == "" {
+			continue
+		}
+		mode := strings.TrimSpace(descriptor.GetMode())
+		if mode == "" {
+			return "", false
+		}
+		return mode, true
+	}
+	return "", false
 }
 
 func dependsOnStep(step *bubuv1alpha1.Step, currentStepID string) bool {
