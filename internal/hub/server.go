@@ -2074,6 +2074,9 @@ func (s *Server) forwardToRealtimeStep(
 		Envelope:   cloneDownstreamEnvelope(originalPacket.GetEnvelope()),
 	}
 	cloneDataPacketFrame(out, originalPacket)
+	if err := applyRuntimePayloadIsolation(out, nextEngramStep, evaluatedInputs, originalPacket); err != nil {
+		return err
+	}
 
 	retryPolicy := resolveStreamingRetryPolicy(nextEngramStep, story)
 	sendCtx, cancel := s.contextWithStepTimeout(ctx, nextEngramStep, story)
@@ -2097,6 +2100,33 @@ func (s *Server) forwardToRealtimeStep(
 	}); !ok {
 		s.log.Info("Failed to deliver or buffer packet; dropping and closing stream", "storyRun", storyRun.Name, "downstreamStep", nextEngramStepID, "reason", "buffer_exhausted")
 		return status.Errorf(codes.ResourceExhausted, "downstream buffer full for step %q", nextEngramStepID)
+	}
+	return nil
+}
+
+func applyRuntimePayloadIsolation(out *transportpb.DataPacket, step *bubuv1alpha1.Step, evaluatedInputs *structpb.Struct, originalPacket *transportpb.DataPacket) error {
+	if out == nil || step == nil || step.Runtime == nil || len(step.Runtime.Raw) == 0 || evaluatedInputs == nil {
+		return nil
+	}
+
+	out.Payload = cloneStruct(evaluatedInputs)
+
+	// Runtime inputs are the downstream component contract for structured
+	// packets. Preserve audio/video media frames, but replace structured binary
+	// payloads so upstream config fields cannot leak into the next component.
+	if originalPacket.GetAudio() != nil || originalPacket.GetVideo() != nil {
+		return nil
+	}
+
+	body, err := json.Marshal(evaluatedInputs.AsMap())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to encode runtime payload for step %q: %v", getStepID(step), err)
+	}
+	out.Frame = &transportpb.DataPacket_Binary{
+		Binary: &transportpb.BinaryFrame{
+			Payload:  body,
+			MimeType: "application/json",
+		},
 	}
 	return nil
 }
