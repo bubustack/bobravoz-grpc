@@ -55,6 +55,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
+const chatMessageTypeCondition = "{{ eq (default \"\" packet.metadata.type) \"chat.message.v1\" }}"
+
 // mockStream is a mock of the HubService_ProcessServer interface
 type mockStream struct {
 	mock.Mock
@@ -229,6 +231,18 @@ func rawExtensionFromMap(t *testing.T, data map[string]any) *runtime.RawExtensio
 	return &runtime.RawExtension{Raw: b}
 }
 
+func bufferedPacketForStep(t *testing.T, s *Server, storyRunName, ns, stepID string) *transportpb.DataPacket {
+	t.Helper()
+	key := s.streamManager.streamKey(storyRunName, ns, stepID)
+	val, ok := s.streamManager.buffers.Load(key)
+	require.True(t, ok, "expected buffered packet for step %q", stepID)
+	buf := val.(*MessageBuffer)
+	buf.mu.Lock()
+	defer buf.mu.Unlock()
+	require.NotEmpty(t, buf.messages, "expected buffered messages for step %q", stepID)
+	return buf.messages[0]
+}
+
 func TestEvaluateStepCondition_StaticFalse(t *testing.T) {
 	s := newTestServer(t)
 	expr := "{{ eq inputs.flag true }}"
@@ -255,7 +269,7 @@ func TestEvaluateStepCondition_RuntimePacket(t *testing.T) {
 
 func TestEvaluateStepCondition_RuntimePacketMetadataMissingDoesNotFail(t *testing.T) {
 	s := newTestServer(t)
-	expr := "{{ eq (default \"\" packet.metadata.type) \"chat.message.v1\" }}"
+	expr := chatMessageTypeCondition
 	payload, err := structpb.NewStruct(map[string]any{"text": "hello"})
 	require.NoError(t, err)
 
@@ -835,7 +849,7 @@ func TestProcessPacket_RuntimeIfSkipsBranch(t *testing.T) {
 
 func TestProcessPacket_RuntimeMetadataIfSkipsBranchWithoutCrashing(t *testing.T) {
 	ns := "ns"
-	ifExpr := "{{ eq (default \"\" packet.metadata.type) \"chat.message.v1\" }}"
+	ifExpr := chatMessageTypeCondition
 	story := &bubuv1alpha1.Story{
 		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
 		Spec: bubuv1alpha1.StorySpec{
@@ -1131,6 +1145,196 @@ func TestProcessPacket_StreamingWithValidationBlocksStepsContext(t *testing.T) {
 	assert.Contains(t, err.Error(), "with block not valid for streaming")
 }
 
+func TestProcessPacket_DropsInvalidCurrentStepOutputWithoutDisconnect(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.RealtimePattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "step-a",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-a"}},
+				},
+				{
+					Name:  "step-b",
+					Needs: []string{"step-a"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "engram-b"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+		},
+	}
+	engramA := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-a", Namespace: ns},
+		Spec: bubuv1alpha1.EngramSpec{
+			Mode:        enums.WorkloadModeDeployment,
+			TemplateRef: refs.EngramTemplateReference{Name: "strict-template"},
+		},
+	}
+	engramB := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "engram-b", Namespace: ns},
+		Spec: bubuv1alpha1.EngramSpec{
+			Mode:        enums.WorkloadModeDeployment,
+			TemplateRef: refs.EngramTemplateReference{Name: "tmpl"},
+		},
+	}
+	strictTemplate := &catalogv1alpha1.EngramTemplate{
+		ObjectMeta: metav1.ObjectMeta{Name: "strict-template"},
+		Spec: catalogv1alpha1.EngramTemplateSpec{
+			OutputSchema: rawExtensionFromMap(t, map[string]any{
+				"type":     "object",
+				"required": []any{"ok"},
+				"properties": map[string]any{
+					"ok": map[string]any{"type": "string"},
+				},
+			}),
+		},
+	}
+	s := newTestServer(t, story, storyRun, engramA, engramB, strictTemplate)
+	payload, err := structpb.NewStruct(map[string]any{"text": "invalid for strict-template"})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{Payload: payload}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "step-a", packet))
+
+	keyB := s.streamManager.streamKey(storyRun.Name, ns, "step-b")
+	_, routed := s.streamManager.buffers.Load(keyB)
+	require.False(t, routed, "invalid source output should be dropped before downstream routing")
+}
+
+func TestProcessPacket_LiveKitChatRuntimeRoutesPacketTextWithoutMemory(t *testing.T) {
+	ns := "ns"
+	chatType := "chat.message.v1"
+	chatCondition := chatMessageTypeCondition
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.RealtimePattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "ingress",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "livekit-bridge"}},
+				},
+				{
+					Name:  "respond",
+					Needs: []string{"ingress"},
+					If:    &chatCondition,
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "assistant"}},
+					Runtime: rawExtensionFromMap(t, map[string]any{
+						"userPrompt": "{{ default \"\" packet.text }}",
+						"speakerId":  "{{ inputs.participant.identity }}",
+					}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+			Inputs: rawExtensionFromMap(t, map[string]any{
+				"participant": map[string]any{"identity": "alice"},
+			}),
+		},
+	}
+	assistant := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "assistant", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, assistant)
+	payload, err := structpb.NewStruct(map[string]any{
+		"text":   "hello from chat",
+		"sender": "alice",
+		"topic":  "lk.chat",
+	})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{
+		Payload:  payload,
+		Metadata: map[string]string{"type": chatType},
+	}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "ingress", packet))
+
+	routed := bufferedPacketForStep(t, s, storyRun.Name, ns, "respond")
+	require.NotNil(t, routed.GetInputs())
+	assert.Equal(t, "hello from chat", routed.GetInputs().AsMap()["userPrompt"])
+	assert.Equal(t, "alice", routed.GetInputs().AsMap()["speakerId"])
+}
+
+func TestProcessPacket_RuntimeInputsReplaceStructuredPayloadAndBinary(t *testing.T) {
+	ns := "ns"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.RealtimePattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name: "transcribe",
+					Ref:  &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "stt"}},
+				},
+				{
+					Name:  "translate",
+					Needs: []string{"transcribe"},
+					Ref:   &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "translator"}},
+					Runtime: rawExtensionFromMap(t, map[string]any{
+						"userPrompt": "{{ default \"\" packet.text }}",
+						"speakerId":  "{{ inputs.participant.identity }}",
+					}),
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: "storyrun", Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: "story"}},
+			Inputs: rawExtensionFromMap(t, map[string]any{
+				"participant": map[string]any{"identity": "alice"},
+			}),
+		},
+	}
+	translator := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "translator", Namespace: ns},
+		Spec:       bubuv1alpha1.EngramSpec{Mode: enums.WorkloadModeDeployment},
+	}
+	s := newTestServer(t, story, storyRun, translator)
+	upstreamPayload := []byte(`{"text":"hello","responseFormat":"json","stream":false,"model":"gpt-4o-mini-transcribe","task":"transcribe"}`)
+	payload, err := structpb.NewStruct(map[string]any{
+		"text":           "hello",
+		"responseFormat": "json",
+		"stream":         false,
+		"model":          "gpt-4o-mini-transcribe",
+		"task":           "transcribe",
+	})
+	require.NoError(t, err)
+	packet := &transportpb.DataPacket{
+		Payload: payload,
+		Frame: &transportpb.DataPacket_Binary{
+			Binary: &transportpb.BinaryFrame{
+				Payload:  upstreamPayload,
+				MimeType: "application/json",
+			},
+		},
+	}
+
+	require.NoError(t, s.processPacket(context.Background(), storyRun.Name, ns, "transcribe", packet))
+
+	routed := bufferedPacketForStep(t, s, storyRun.Name, ns, "translate")
+	require.NotNil(t, routed.GetPayload())
+	assert.Equal(t, "hello", routed.GetPayload().AsMap()["userPrompt"])
+	assert.NotContains(t, routed.GetPayload().AsMap(), "responseFormat")
+	require.NotNil(t, routed.GetBinary())
+	assert.JSONEq(t, `{"speakerId":"alice","userPrompt":"hello"}`, string(routed.GetBinary().GetPayload()))
+	assert.Equal(t, "application/json", routed.GetBinary().GetMimeType())
+	assert.NotContains(t, string(routed.GetBinary().GetPayload()), "responseFormat")
+}
+
 func TestStreamingTemplateScopes(t *testing.T) {
 	staticScope := streamingStaticScope()
 	runtimeScope := streamingRuntimeScope()
@@ -1312,6 +1516,59 @@ func TestServer_Process_RejectsMissingConnectorGeneration(t *testing.T) {
 	assert.Error(t, err)
 	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 	assert.Contains(t, err.Error(), "missing connector-generation metadata")
+}
+
+func TestServer_ProcessKeepsLifecycleDedupOnStreamClose(t *testing.T) {
+	ns := "test-ns"
+	storyRunName := "test-storyrun"
+	story := &bubuv1alpha1.Story{
+		ObjectMeta: metav1.ObjectMeta{Name: "story", Namespace: ns},
+		Spec: bubuv1alpha1.StorySpec{
+			Pattern: enums.RealtimePattern,
+			Steps: []bubuv1alpha1.Step{
+				{
+					Name:      "ingress",
+					Transport: "chat",
+					Ref:       &refs.EngramReference{ObjectReference: refs.ObjectReference{Name: "livekit-bridge"}},
+				},
+			},
+		},
+	}
+	storyRun := &runsv1alpha1.StoryRun{
+		ObjectMeta: metav1.ObjectMeta{Name: storyRunName, Namespace: ns},
+		Spec: runsv1alpha1.StoryRunSpec{
+			StoryRef: refs.StoryReference{ObjectReference: refs.ObjectReference{Name: story.Name}},
+		},
+	}
+	engram := &bubuv1alpha1.Engram{
+		ObjectMeta: metav1.ObjectMeta{Name: "livekit-bridge", Namespace: ns},
+		Spec: bubuv1alpha1.EngramSpec{
+			Mode:        enums.WorkloadModeDeployment,
+			TemplateRef: refs.EngramTemplateReference{Name: "livekit-bridge"},
+		},
+	}
+	s := newTestServer(t, story, storyRun, engram)
+	key := lifecycleHookDedupKey(ns, storyRunName, lifecycleHookStoryReadyEvent, "")
+	require.True(t, s.claimLifecycleHook(key))
+
+	md := metadata.New(map[string]string{
+		metaStoryRunName:                  storyRunName,
+		metaStoryRunNS:                    ns,
+		metaCurrentStepID:                 "ingress",
+		metaConnectorGeneration:           "1",
+		coretransport.ProtocolMetadataKey: coretransport.ProtocolVersion,
+	})
+	ctx := metadata.NewIncomingContext(context.Background(), md)
+	stream := newMockStream(ctx)
+	close(stream.RecvChan)
+	stream.On("Context").Return(ctx)
+
+	require.NoError(t, s.Process(stream))
+
+	s.hookMu.Lock()
+	_, exists := s.emittedHooks[key]
+	s.hookMu.Unlock()
+	require.True(t, exists, "ordinary stream close must not clear StoryRun lifecycle dedupe")
 }
 
 func TestServer_Process_RejectsInvalidConnectorGeneration(t *testing.T) {

@@ -556,7 +556,6 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	meta.Info(s.log, "Hub stream registered successfully")
 	defer func() {
 		s.streamManager.RemoveStream(storyRunName, storyRunNS, currentStepID, streamEntry)
-		s.releaseLifecycleHooksForStoryRun(storyRunName, storyRunNS)
 		s.maybeSignalTopologyTerminated(storyRunName, storyRunNS)
 	}()
 	streamContract = streamContract.WithStage(meta)
@@ -898,20 +897,6 @@ func (s *Server) releaseLifecycleHook(key string) {
 	delete(s.emittedHooks, key)
 }
 
-// releaseLifecycleHooksForStoryRun removes all emitted-hook entries whose key
-// contains the given storyrun identifier. Call this when a storyrun's streaming
-// topology is torn down to prevent unbounded map growth.
-func (s *Server) releaseLifecycleHooksForStoryRun(storyRunName, storyRunNamespace string) {
-	prefix := storyRunNamespace + "/" + storyRunName + ":"
-	s.hookMu.Lock()
-	defer s.hookMu.Unlock()
-	for key := range s.emittedHooks {
-		if strings.HasPrefix(key, prefix) {
-			delete(s.emittedHooks, key)
-		}
-	}
-}
-
 // recvResult represents the result of a stream.Recv() operation
 type recvResult struct {
 	req *transportpb.ProcessRequest
@@ -1136,7 +1121,12 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 		if sourceEngram, resolveErr := s.resolveEngramForStep(ctx, storyRun.Namespace, currentStep); resolveErr == nil {
 			outputMap := mergeMaps(payloadAsMap(in.Payload), payloadAsMap(in.Inputs))
 			if valErr := s.validateEngramOutputs(ctx, currentStepID, sourceEngram, outputMap); valErr != nil {
-				return finalize(valErr)
+				s.log.Error(valErr, "Dropping packet with invalid current step outputs",
+					"storyRun", storyRunName,
+					"namespace", storyRunNS,
+					"step", currentStepID,
+				)
+				return finalize(nil)
 			}
 		}
 	}
@@ -2084,6 +2074,9 @@ func (s *Server) forwardToRealtimeStep(
 		Envelope:   cloneDownstreamEnvelope(originalPacket.GetEnvelope()),
 	}
 	cloneDataPacketFrame(out, originalPacket)
+	if err := applyRuntimePayloadIsolation(out, nextEngramStep, evaluatedInputs, originalPacket); err != nil {
+		return err
+	}
 
 	retryPolicy := resolveStreamingRetryPolicy(nextEngramStep, story)
 	sendCtx, cancel := s.contextWithStepTimeout(ctx, nextEngramStep, story)
@@ -2107,6 +2100,33 @@ func (s *Server) forwardToRealtimeStep(
 	}); !ok {
 		s.log.Info("Failed to deliver or buffer packet; dropping and closing stream", "storyRun", storyRun.Name, "downstreamStep", nextEngramStepID, "reason", "buffer_exhausted")
 		return status.Errorf(codes.ResourceExhausted, "downstream buffer full for step %q", nextEngramStepID)
+	}
+	return nil
+}
+
+func applyRuntimePayloadIsolation(out *transportpb.DataPacket, step *bubuv1alpha1.Step, evaluatedInputs *structpb.Struct, originalPacket *transportpb.DataPacket) error {
+	if out == nil || step == nil || step.Runtime == nil || len(step.Runtime.Raw) == 0 || evaluatedInputs == nil {
+		return nil
+	}
+
+	out.Payload = cloneStruct(evaluatedInputs)
+
+	// Runtime inputs are the downstream component contract for structured
+	// packets. Preserve audio/video media frames, but replace structured binary
+	// payloads so upstream config fields cannot leak into the next component.
+	if originalPacket.GetAudio() != nil || originalPacket.GetVideo() != nil {
+		return nil
+	}
+
+	body, err := json.Marshal(evaluatedInputs.AsMap())
+	if err != nil {
+		return status.Errorf(codes.Internal, "failed to encode runtime payload for step %q: %v", getStepID(step), err)
+	}
+	out.Frame = &transportpb.DataPacket_Binary{
+		Binary: &transportpb.BinaryFrame{
+			Payload:  body,
+			MimeType: "application/json",
+		},
 	}
 	return nil
 }
