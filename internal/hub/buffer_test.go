@@ -260,6 +260,7 @@ func TestBufferConcurrentEnqueueAndFlush(t *testing.T) {
 	const messagesPerEnqueuer = 100
 
 	var wg sync.WaitGroup
+	enqueuersDone := make(chan struct{})
 
 	// Start 10 goroutines each enqueuing messages
 	for i := range numEnqueuers {
@@ -278,6 +279,10 @@ func TestBufferConcurrentEnqueueAndFlush(t *testing.T) {
 			}
 		}(i)
 	}
+	go func() {
+		wg.Wait()
+		close(enqueuersDone)
+	}()
 
 	// Start 1 goroutine flushing periodically
 	flushDone := make(chan struct{})
@@ -285,31 +290,29 @@ func TestBufferConcurrentEnqueueAndFlush(t *testing.T) {
 	go func() {
 		defer close(flushDone)
 		ctx := context.Background()
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
 		for {
 			select {
-			case <-time.After(time.Millisecond):
+			case <-ticker.C:
 				flushed, _ := buf.FlushWithSender(ctx, func(pkt *transportpb.DataPacket) error {
 					return nil
 				})
 				totalFlushed += int64(flushed)
-			default:
+			case <-enqueuersDone:
 				if buf.Size() == 0 {
-					// Check if all enqueuers are done
-					time.Sleep(10 * time.Millisecond)
-					// Final flush
-					flushed, _ := buf.FlushWithSender(ctx, func(pkt *transportpb.DataPacket) error {
-						return nil
-					})
-					totalFlushed += int64(flushed)
-					if buf.Size() == 0 {
-						return
-					}
+					return
+				}
+				flushed, _ := buf.FlushWithSender(ctx, func(pkt *transportpb.DataPacket) error {
+					return nil
+				})
+				totalFlushed += int64(flushed)
+				if buf.Size() == 0 {
+					return
 				}
 			}
 		}
 	}()
-
-	wg.Wait()
 
 	// Wait for flush goroutine to finish
 	select {
