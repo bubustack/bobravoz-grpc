@@ -556,7 +556,6 @@ func (s *Server) Process(stream transportpb.HubService_ProcessServer) error {
 	meta.Info(s.log, "Hub stream registered successfully")
 	defer func() {
 		s.streamManager.RemoveStream(storyRunName, storyRunNS, currentStepID, streamEntry)
-		s.releaseLifecycleHooksForStoryRun(storyRunName, storyRunNS)
 		s.maybeSignalTopologyTerminated(storyRunName, storyRunNS)
 	}()
 	streamContract = streamContract.WithStage(meta)
@@ -898,20 +897,6 @@ func (s *Server) releaseLifecycleHook(key string) {
 	delete(s.emittedHooks, key)
 }
 
-// releaseLifecycleHooksForStoryRun removes all emitted-hook entries whose key
-// contains the given storyrun identifier. Call this when a storyrun's streaming
-// topology is torn down to prevent unbounded map growth.
-func (s *Server) releaseLifecycleHooksForStoryRun(storyRunName, storyRunNamespace string) {
-	prefix := storyRunNamespace + "/" + storyRunName + ":"
-	s.hookMu.Lock()
-	defer s.hookMu.Unlock()
-	for key := range s.emittedHooks {
-		if strings.HasPrefix(key, prefix) {
-			delete(s.emittedHooks, key)
-		}
-	}
-}
-
 // recvResult represents the result of a stream.Recv() operation
 type recvResult struct {
 	req *transportpb.ProcessRequest
@@ -1136,7 +1121,12 @@ func (s *Server) processPacket(ctx context.Context, storyRunName, storyRunNS, cu
 		if sourceEngram, resolveErr := s.resolveEngramForStep(ctx, storyRun.Namespace, currentStep); resolveErr == nil {
 			outputMap := mergeMaps(payloadAsMap(in.Payload), payloadAsMap(in.Inputs))
 			if valErr := s.validateEngramOutputs(ctx, currentStepID, sourceEngram, outputMap); valErr != nil {
-				return finalize(valErr)
+				s.log.Error(valErr, "Dropping packet with invalid current step outputs",
+					"storyRun", storyRunName,
+					"namespace", storyRunNS,
+					"step", currentStepID,
+				)
+				return finalize(nil)
 			}
 		}
 	}
